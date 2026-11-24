@@ -12,7 +12,6 @@ RUN bun run build
 FROM oven/bun:1
 WORKDIR /app
 ENV NODE_ENV=production
-ENV PORT=3000
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
@@ -25,5 +24,6 @@ COPY --from=build /app/tsconfig.json ./tsconfig.json
 COPY --from=build /app/vite.config.ts ./vite.config.ts
 COPY --from=build /app/index.html ./index.html
 
+# The platform assigns the port via PORT / SERVER_PORT / APP_PORT.
 EXPOSE 3000
 CMD ["bun", "run", "start"]

@@ -26,7 +26,14 @@ import {
   type WebpImageAsset,
 } from "./src/types/product.ts";
 
-const PORT = Number(process.env.PORT || 3000);
+// Hosting platforms assign the port; names differ per provider:
+// Altare uses SERVER_PORT, most PaaS use PORT.
+const PORT = Number(
+  process.env.PORT ||
+    process.env.SERVER_PORT ||
+    process.env.APP_PORT ||
+    3000
+);
 
 function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): EnrichmentSettings {
   const validTypes = new Set(["openrouter", "openai", "groq", "custom", "pollinations"]);
@@ -1808,19 +1815,24 @@ async function startServer() {
     }
   );
 
-  if (process.env.NODE_ENV !== "production") {
+  // Serve the built SPA when a build exists; otherwise fall back to Vite dev.
+  // Deciding on the build output (not only NODE_ENV) avoids crashing in
+  // production when NODE_ENV was not set by the host.
+  const distPath = path.resolve(process.cwd(), "dist");
+  const hasBuild = fs.existsSync(path.join(distPath, "index.html"));
+
+  if (hasBuild) {
+    app.use(express.static(distPath));
+    app.get("/{*splat}", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  } else {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("/{*splat}", (_req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
