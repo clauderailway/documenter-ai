@@ -161,7 +161,8 @@ export default function App() {
                 : `خطا در جستجو و دریافت اطلاعات کالا (کد ${res.status})`);
             if ((res.status === 503 || res.status === 504 || res.status === 429) && attempt < maxClientAttempts) {
               lastErrMsg = msg;
-              await new Promise((resolve) => setTimeout(resolve, 3500));
+              const waitMs = res.status === 429 ? 6000 : 3500;
+              await new Promise((resolve) => setTimeout(resolve, waitMs));
               if (stopRequestedRef.current) break;
               continue;
             }
@@ -187,8 +188,11 @@ export default function App() {
           return;
         } catch (err) {
           lastErrMsg = err instanceof Error ? err.message : "خطا در پردازش کالا";
-          if (attempt < maxClientAttempts && lastErrMsg.includes("شلوغ")) {
-            await new Promise((resolve) => setTimeout(resolve, 3500));
+          if (
+            attempt < maxClientAttempts &&
+            (lastErrMsg.includes("شلوغ") || lastErrMsg.includes("سهمیه") || lastErrMsg.includes("429"))
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 5000));
             if (stopRequestedRef.current) break;
             continue;
           }
@@ -225,7 +229,12 @@ export default function App() {
           const item = queue[index];
           await enrichSingleProduct(item);
           if (!stopRequestedRef.current && cursor < queue.length) {
-            await new Promise((resolve) => setTimeout(resolve, 500));
+            const keyCount = (settingsRef.current.geminiApiKey || "")
+              .split(/[\r\n,;\s]+/)
+              .map((s) => s.trim())
+              .filter((s) => s.length >= 10).length;
+            const paceMs = keyCount >= 2 ? 900 : settingsRef.current.freeTierSaver !== false ? 2400 : 800;
+            await new Promise((resolve) => setTimeout(resolve, paceMs));
           }
         }
       };

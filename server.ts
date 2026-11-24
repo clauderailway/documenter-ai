@@ -8,6 +8,7 @@ import {
   extractProductListFromScan,
   findMoreProductPagesWithGemini,
   researchProductWithGemini,
+  testGeminiKeys,
 } from "./server/gemini.ts";
 import {
   collectWebpImagesForProduct,
@@ -29,6 +30,14 @@ const PORT = Number(process.env.PORT || 3000);
 
 function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): EnrichmentSettings {
   const validTypes = new Set(["openrouter", "openai", "groq", "custom", "pollinations"]);
+  const validGeminiModes = new Set([
+    "auto_free",
+    "auto_quality",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-4-hydrogen",
+  ]);
   const rawProviders = Array.isArray(input?.customProviders) ? input.customProviders : [];
   const customProviders = rawProviders
     .slice(0, 20)
@@ -39,9 +48,11 @@ function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): Enric
       type: (validTypes.has(p.type) ? p.type : "custom") as EnrichmentSettings["customProviders"][number]["type"],
       baseUrl: typeof p.baseUrl === "string" ? p.baseUrl.trim().slice(0, 300) : "",
       model: typeof p.model === "string" ? p.model.trim().slice(0, 120) : "",
-      apiKey: typeof p.apiKey === "string" ? p.apiKey.trim().slice(0, 200) : "",
+      apiKey: typeof p.apiKey === "string" ? p.apiKey.trim().slice(0, 300) : "",
     }))
     .filter((p) => p.id && p.name && p.model);
+
+  const rawModelMode = typeof input?.geminiModelMode === "string" ? input.geminiModelMode.trim() : "";
 
   return {
     domainProfile: input?.domainProfile ?? DEFAULT_SETTINGS.domainProfile,
@@ -62,7 +73,11 @@ function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): Enric
         ? input.aiProviderId.trim().slice(0, 64)
         : DEFAULT_SETTINGS.aiProviderId,
     customProviders,
-    geminiApiKey: typeof input?.geminiApiKey === "string" ? input.geminiApiKey.trim().slice(0, 200) : "",
+    geminiApiKey: typeof input?.geminiApiKey === "string" ? input.geminiApiKey.trim().slice(0, 4000) : "",
+    geminiModelMode: (validGeminiModes.has(rawModelMode)
+      ? rawModelMode
+      : DEFAULT_SETTINGS.geminiModelMode) as EnrichmentSettings["geminiModelMode"],
+    freeTierSaver: input?.freeTierSaver !== false,
     openrouterApiKey:
       typeof input?.openrouterApiKey === "string" ? input.openrouterApiKey.trim().slice(0, 200) : "",
     groqApiKey: typeof input?.groqApiKey === "string" ? input.groqApiKey.trim().slice(0, 200) : "",
@@ -81,11 +96,16 @@ function csvEscape(value: string): string {
 function formatErrorMessage(err: unknown): { status: number; message: string; detail?: string } {
   console.error("[API Error]", err);
   const msg = err instanceof Error ? err.message : String(err);
-  if (msg.includes("API_KEY_INVALID") || msg.includes("PERMISSION_DENIED") || msg.includes("403")) {
+  if (
+    msg.includes("API_KEY_INVALID") ||
+    msg.includes("API key not valid") ||
+    msg.includes("PERMISSION_DENIED") ||
+    msg.includes("403")
+  ) {
     return {
       status: 403,
       message:
-        "کلید API معتبر نیست یا دسترسی ندارد. کلید Gemini / OpenRouter / Groq را در بخش «تنظیمات و پروایدرها» بررسی کنید.",
+        "کلید API معتبر نیست یا دسترسی ندارد. کلیدهای Gemini / OpenRouter / Groq را در بخش «تنظیمات و پروایدرها» بررسی کنید.",
       detail: msg,
     };
   }
@@ -99,7 +119,7 @@ function formatErrorMessage(err: unknown): { status: number; message: string; de
     return {
       status: 429,
       message:
-        "سهمیه درخواست مدل‌های رایگان این لحظه پر شده است. سیستم به‌طور خودکار مدل‌های رایگان دیگر را امتحان می‌کند؛ چند لحظه بعد دوباره تلاش کنید یا کلید رایگان OpenRouter/Groq را در تنظیمات اضافه کنید.",
+        "سهمیه درخواست مدل‌های رایگان این لحظه پر شده است. سیستم به‌طور خودکار کلیدها، مدل‌های رایگان و سرویس‌های دیگر را امتحان می‌کند؛ چند لحظه بعد دوباره تلاش کنید یا کلید رایگان OpenRouter/Groq را در تنظیمات اضافه کنید.",
       detail: msg,
     };
   }
@@ -113,7 +133,7 @@ function formatErrorMessage(err: unknown): { status: number; message: string; de
     return {
       status: 503,
       message:
-        "همه مدل‌های رایگان در این لحظه شلوغ هستند (خطای 503 از سمت سرور مدل). چند لحظه بعد دوباره امتحان کنید — سیستم به‌صورت خودکار بین مدل‌ها و سرویس‌های رایگان جابه‌جا می‌شود.",
+        "همه مدل‌های رایگان در این لحظه شلوغ هستند (خطای 503 از سمت سرور مدل). چند لحظه بعد دوباره امتحان کنید — سیستم به‌صورت خودکار بین کلیدها، مدل‌ها و سرویس‌های رایگان جابه‌جا می‌شود.",
       detail: msg,
     };
   }
@@ -143,6 +163,17 @@ async function startServer() {
 
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
+  });
+
+  app.post("/api/ai/test-keys", async (req, res) => {
+    try {
+      const settings = sanitizeSettings(req.body?.settings);
+      const results = await testGeminiKeys(settings.geminiApiKey, settings.geminiModelMode);
+      res.json({ results });
+    } catch (err) {
+      const { status, message } = formatErrorMessage(err);
+      res.status(status).json({ error: message });
+    }
   });
 
   app.get("/api/webp/:filename", (req, res) => {
@@ -260,7 +291,8 @@ async function startServer() {
             research.titleEn || effectiveQuery,
             research.brand,
             settings.domainProfile === "medical",
-            settings
+            settings.geminiApiKey,
+            settings.freeTierSaver
           );
           const existingSet = new Set(pageUrls);
           const freshPages = extraPages.filter((u) => !existingSet.has(u));
@@ -331,7 +363,8 @@ async function startServer() {
         productName,
         brand,
         settings.domainProfile === "medical",
-        settings
+        settings.geminiApiKey,
+        settings.freeTierSaver
       );
       const images = await collectWebpImagesForProduct({
         pageUrls: pages,

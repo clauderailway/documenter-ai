@@ -6,6 +6,13 @@ export type LongDescFormat = 'structured' | 'html';
 export type WebpFitMode = 'contain_white' | 'inside';
 export type DomainProfile = 'medical' | 'general';
 export type AiProviderType = 'gemini' | 'openrouter' | 'openai' | 'groq' | 'custom' | 'pollinations';
+export type GeminiModelMode =
+  | 'auto_free'
+  | 'auto_quality'
+  | 'gemini-flash-latest'
+  | 'gemini-flash-lite-latest'
+  | 'gemini-3.1-flash-lite'
+  | 'gemini-4-hydrogen';
 
 export interface CustomProviderProfile {
   id: string;
@@ -30,6 +37,8 @@ export interface EnrichmentSettings {
   aiProviderId: string;
   customProviders: CustomProviderProfile[];
   geminiApiKey: string;
+  geminiModelMode: GeminiModelMode;
+  freeTierSaver: boolean;
   openrouterApiKey: string;
   groqApiKey: string;
   autoFreeFallback: boolean;
@@ -95,6 +104,8 @@ export const DEFAULT_SETTINGS: EnrichmentSettings = {
   aiProviderId: 'gemini-default',
   customProviders: [],
   geminiApiKey: '',
+  geminiModelMode: 'auto_free',
+  freeTierSaver: true,
   openrouterApiKey: '',
   groqApiKey: '',
   autoFreeFallback: true,
