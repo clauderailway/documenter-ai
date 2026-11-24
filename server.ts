@@ -28,7 +28,7 @@ import {
 const PORT = Number(process.env.PORT || 3000);
 
 function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): EnrichmentSettings {
-  const validTypes = new Set(["openrouter", "openai", "groq", "custom"]);
+  const validTypes = new Set(["openrouter", "openai", "groq", "custom", "pollinations"]);
   const rawProviders = Array.isArray(input?.customProviders) ? input.customProviders : [];
   const customProviders = rawProviders
     .slice(0, 20)
@@ -39,6 +39,7 @@ function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): Enric
       type: (validTypes.has(p.type) ? p.type : "custom") as EnrichmentSettings["customProviders"][number]["type"],
       baseUrl: typeof p.baseUrl === "string" ? p.baseUrl.trim().slice(0, 300) : "",
       model: typeof p.model === "string" ? p.model.trim().slice(0, 120) : "",
+      apiKey: typeof p.apiKey === "string" ? p.apiKey.trim().slice(0, 200) : "",
     }))
     .filter((p) => p.id && p.name && p.model);
 
@@ -62,6 +63,10 @@ function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): Enric
         : DEFAULT_SETTINGS.aiProviderId,
     customProviders,
     geminiApiKey: typeof input?.geminiApiKey === "string" ? input.geminiApiKey.trim().slice(0, 200) : "",
+    openrouterApiKey:
+      typeof input?.openrouterApiKey === "string" ? input.openrouterApiKey.trim().slice(0, 200) : "",
+    groqApiKey: typeof input?.groqApiKey === "string" ? input.groqApiKey.trim().slice(0, 200) : "",
+    autoFreeFallback: input?.autoFreeFallback !== false,
   };
 }
 
@@ -79,15 +84,22 @@ function formatErrorMessage(err: unknown): { status: number; message: string; de
   if (msg.includes("API_KEY_INVALID") || msg.includes("PERMISSION_DENIED") || msg.includes("403")) {
     return {
       status: 403,
-      message: "کلید API در تنظیمات پروژه معتبر نیست یا دسترسی ندارد. لطفاً بخش Settings > Secrets را بررسی کنید.",
+      message:
+        "کلید API معتبر نیست یا دسترسی ندارد. کلید Gemini / OpenRouter / Groq را در بخش «تنظیمات و پروایدرها» بررسی کنید.",
       detail: msg,
     };
   }
-  if (msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
+  if (
+    msg.includes("RESOURCE_EXHAUSTED") ||
+    msg.includes("quota") ||
+    msg.includes("429") ||
+    msg.includes("402") ||
+    msg.includes("FREE_LIMIT")
+  ) {
     return {
       status: 429,
       message:
-        "سهمیه درخواست کلید API فعلی موقتاً پر شده است. چند لحظه صبر کنید یا در بخش Settings > Secrets یک کلید API دارای صورت‌حساب (Billing) انتخاب کنید.",
+        "سهمیه درخواست مدل‌های رایگان این لحظه پر شده است. سیستم به‌طور خودکار مدل‌های رایگان دیگر را امتحان می‌کند؛ چند لحظه بعد دوباره تلاش کنید یا کلید رایگان OpenRouter/Groq را در تنظیمات اضافه کنید.",
       detail: msg,
     };
   }
@@ -101,7 +113,19 @@ function formatErrorMessage(err: unknown): { status: number; message: string; de
     return {
       status: 503,
       message:
-        "سرویس پردازش در نسخه رایگان موقتاً بسیار شلوغ است (خطای 503 از سمت سرور مدل). چند لحظه بعد دوباره امتحان کنید یا در Settings > Secrets کلید API با ظرفیت بالاتر (Billing) متصل کنید.",
+        "همه مدل‌های رایگان در این لحظه شلوغ هستند (خطای 503 از سمت سرور مدل). چند لحظه بعد دوباره امتحان کنید — سیستم به‌صورت خودکار بین مدل‌ها و سرویس‌های رایگان جابه‌جا می‌شود.",
+      detail: msg,
+    };
+  }
+  if (
+    msg.includes("هیچ سرویس هوش مصنوعی") ||
+    msg.includes("سرویس بینایی") ||
+    msg.includes("کلید رایگان") ||
+    msg.includes("کلید Gemini")
+  ) {
+    return {
+      status: 400,
+      message: msg,
       detail: msg,
     };
   }
@@ -236,7 +260,7 @@ async function startServer() {
             research.titleEn || effectiveQuery,
             research.brand,
             settings.domainProfile === "medical",
-            settings.geminiApiKey
+            settings
           );
           const existingSet = new Set(pageUrls);
           const freshPages = extraPages.filter((u) => !existingSet.has(u));
@@ -307,7 +331,7 @@ async function startServer() {
         productName,
         brand,
         settings.domainProfile === "medical",
-        settings.geminiApiKey
+        settings
       );
       const images = await collectWebpImagesForProduct({
         pageUrls: pages,

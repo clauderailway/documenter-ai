@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Check, Cpu, Plus, Trash2 } from "lucide-react";
+import { Check, Cpu, KeyRound, Plus, Trash2, Zap } from "lucide-react";
 import type {
   ContentTone,
   CustomProviderProfile,
@@ -23,10 +23,16 @@ const PROVIDER_PRESETS: Record<
   { label: string; baseUrl: string; defaultModel: string; envVar: string }
 > = {
   openrouter: {
-    label: "OpenRouter (سازگار با OpenAI)",
+    label: "OpenRouter (مدل‌های رایگان)",
     baseUrl: "https://openrouter.ai/api/v1",
-    defaultModel: "google/gemini-2.5-flash",
+    defaultModel: "openrouter/free",
     envVar: "OPENROUTER_API_KEY",
+  },
+  groq: {
+    label: "Groq (رایگان)",
+    baseUrl: "https://api.groq.com/openai/v1",
+    defaultModel: "llama-3.3-70b-versatile",
+    envVar: "GROQ_API_KEY",
   },
   openai: {
     label: "OpenAI",
@@ -34,17 +40,17 @@ const PROVIDER_PRESETS: Record<
     defaultModel: "gpt-4o-mini",
     envVar: "OPENAI_API_KEY",
   },
-  groq: {
-    label: "Groq",
-    baseUrl: "https://api.groq.com/openai/v1",
-    defaultModel: "llama-3.3-70b-versatile",
-    envVar: "GROQ_API_KEY",
-  },
   custom: {
     label: "سفارشی (سازگار با OpenAI مثل DeepSeek / AvalAI / Together)",
     baseUrl: "https://api.deepseek.com/v1",
     defaultModel: "deepseek-chat",
     envVar: "CUSTOM_AI_API_KEY",
+  },
+  pollinations: {
+    label: "Pollinations (بدون کلید API)",
+    baseUrl: "https://text.pollinations.ai/openai",
+    defaultModel: "openai-fast",
+    envVar: "—",
   },
 };
 
@@ -53,10 +59,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
   const [providerName, setProviderName] = useState("OpenRouter اصلی");
   const [providerBaseUrl, setProviderBaseUrl] = useState(PROVIDER_PRESETS.openrouter.baseUrl);
   const [providerModel, setProviderModel] = useState(PROVIDER_PRESETS.openrouter.defaultModel);
+  const [providerApiKey, setProviderApiKey] = useState("");
   const [providerFormError, setProviderFormError] = useState<string | null>(null);
 
   const customProviders = settings.customProviders ?? [];
   const activeProviderId = settings.aiProviderId || "gemini-default";
+  const isKeylessType = providerType === "pollinations";
 
   const handleProviderTypeChange = (nextType: ExternalProviderType) => {
     setProviderType(nextType);
@@ -96,6 +104,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
       type: providerType,
       baseUrl: cleanBaseUrl,
       model: cleanModel,
+      apiKey: providerApiKey.trim() || undefined,
     };
 
     onChange({
@@ -103,6 +112,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
       aiProviderId: newProfile.id,
       customProviders: [...customProviders, newProfile],
     });
+    setProviderApiKey("");
     setProviderFormError(null);
   };
 
@@ -143,7 +153,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                 ارائه‌دهندگان هوش مصنوعی (AI Providers)
               </h2>
               <p className="text-xs text-slate-500 leading-relaxed">
-                می‌توانید علاوه بر موتور پیش‌فرض سیستم، ارائه‌دهندگان سازگار با OpenAI (مثل OpenRouter، OpenAI، Groq یا سرویس‌های سفارشی) را اضافه و انتخاب کنید.
+                همه سرویس‌ها با سهمیه رایگان کار می‌کنند: Gemini رایگان به‌صورت پیش‌فرض فعال است و در صورت شلوغی یا اتمام سهمیه، خودکار به مدل رایگان بعدی و سپس OpenRouter / Groq / Pollinations سوییچ می‌شود.
               </p>
             </div>
           </div>
@@ -182,10 +192,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                   </span>
                   <div className="min-w-0">
                     <div className="text-sm font-semibold text-slate-900">
-                      موتور پیش‌فرض (Gemini با Failover خودکار)
+                      موتور پیش‌فرض (Gemini رایگان + جابه‌جایی خودکار مدل‌ها)
                     </div>
                     <div className="text-xs text-slate-500 font-mono truncate" dir="ltr">
-                      gemini-4-hydrogen · gemini-3.1-flash-lite
+                      gemini-3.8-flash · 3.6-flash · 3.5-flash-lite · gemma-4
                     </div>
                   </div>
                 </div>
@@ -221,7 +231,81 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                   )}
                 </div>
                 <p className="text-[11px] text-slate-500 leading-relaxed">
-                  با وارد کردن کلید AI Studio شخصی خود، تمامی درخواست‌های هوش مصنوعی با حساب کاربری و سهمیه شما پردازش می‌شوند.
+                  کلید رایگان از aistudio.google.com/apikey بگیرید. با وارد کردن کلید، درخواست‌ها با سهمیه حساب شما پردازش می‌شوند؛ خالی بگذارید تا از کلید سرور استفاده شود.
+                </p>
+              </div>
+            </div>
+
+            {/* Auto free fallback + extra free providers */}
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-4 space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-1 min-w-0">
+                  <div className="text-sm font-semibold text-slate-900 flex items-center gap-1.5">
+                    <Zap className="w-4 h-4 text-emerald-600" />
+                    جابه‌جایی خودکار بین مدل‌های رایگان
+                  </div>
+                  <p className="text-[11px] text-slate-600 leading-relaxed">
+                    وقتی یک مدل شلوغ یا سهمیه‌اش تمام شود، سیستم خودکار مدل بعدی و سپس ارائه‌دهنده رایگان بعدی را امتحان می‌کند تا کار همیشه ادامه پیدا کند.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={settings.autoFreeFallback !== false}
+                  onClick={() =>
+                    onChange({ ...settings, autoFreeFallback: settings.autoFreeFallback === false })
+                  }
+                  className={`relative w-11 h-6 rounded-full transition-colors shrink-0 cursor-pointer ${
+                    settings.autoFreeFallback !== false ? "bg-emerald-600" : "bg-slate-300"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${
+                      settings.autoFreeFallback !== false ? "left-[22px]" : "left-0.5"
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center gap-2">
+                  <KeyRound className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                  <label className="text-[11px] font-medium text-slate-700">
+                    کلید رایگان OpenRouter (اختیاری)
+                  </label>
+                </div>
+                <input
+                  type="password"
+                  dir="ltr"
+                  value={settings.openrouterApiKey || ""}
+                  onChange={(e) => onChange({ ...settings, openrouterApiKey: e.target.value })}
+                  placeholder="sk-or-v1-..."
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-emerald-600 focus:outline-none"
+                />
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  از openrouter.ai/keys بگیرید (رایگان، بدون کارت). مدل‌های <code className="font-mono">:free</code> مثل Gemma 4 و Nemotron به‌صورت خودکار استفاده می‌شوند.
+                </p>
+
+                <div className="flex items-center gap-2 pt-1">
+                  <KeyRound className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                  <label className="text-[11px] font-medium text-slate-700">
+                    کلید رایگان Groq (اختیاری)
+                  </label>
+                </div>
+                <input
+                  type="password"
+                  dir="ltr"
+                  value={settings.groqApiKey || ""}
+                  onChange={(e) => onChange({ ...settings, groqApiKey: e.target.value })}
+                  placeholder="gsk_..."
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-emerald-600 focus:outline-none"
+                />
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  از console.groq.com/keys بگیرید. مدل‌های Llama و GPT-OSS با سرعت بالا و سهمیه رایگان.
+                </p>
+
+                <p className="text-[11px] text-slate-500 leading-relaxed pt-1">
+                  حتی بدون هیچ کلیدی، آخرین لایه پشتیبان (Pollinations) کار می‌کند؛ اما نسخه بدون کلید آن محدود به یک پاسخ در هر ۴۵ ثانیه است و برای پردازش گروهی، کلید Gemini یا OpenRouter/Groq توصیه می‌شود.
                 </p>
               </div>
             </div>
@@ -230,6 +314,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
             {customProviders.map((prov) => {
               const isSelected = activeProviderId === prov.id;
               const envHint = PROVIDER_PRESETS[prov.type]?.envVar ?? "CUSTOM_AI_API_KEY";
+              const keyless = prov.type === "pollinations";
+              const hasKey = Boolean(prov.apiKey) || keyless;
               return (
                 <div
                   key={prov.id}
@@ -266,7 +352,16 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                         {prov.model} · {prov.baseUrl}
                       </div>
                       <div className="text-[11px] text-slate-400">
-                        متغیر کلید روی سرور: <code className="font-mono text-slate-600">{envHint}</code>
+                        {keyless ? (
+                          "بدون نیاز به کلید API"
+                        ) : hasKey ? (
+                          <span className="text-emerald-600">کلید ذخیره شده ✓</span>
+                        ) : (
+                          <>
+                            بدون کلید — از متغیر سرور{" "}
+                            <code className="font-mono text-slate-600">{envHint}</code> استفاده می‌شود
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -294,7 +389,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
             })}
           </div>
 
-          {/* Add New Provider Form (Server-side env key only, no API key input in UI) */}
+          {/* Add New Provider Form */}
           <form
             onSubmit={handleAddProvider}
             className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 space-y-4"
@@ -351,8 +446,23 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                   dir="ltr"
                   value={providerModel}
                   onChange={(e) => setProviderModel(e.target.value)}
-                  placeholder="google/gemini-2.5-flash"
+                  placeholder="google/gemma-4-31b-it:free"
                   className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-blue-600 focus:outline-none"
+                />
+              </div>
+
+              <div className="md:col-span-2 space-y-1.5">
+                <label className="block text-xs font-medium text-slate-700">
+                  کلید API{isKeylessType ? " (برای این سرویس لازم نیست)" : " (اختیاری اگر روی سرور تنظیم شده)"}
+                </label>
+                <input
+                  type="password"
+                  dir="ltr"
+                  disabled={isKeylessType}
+                  value={providerApiKey}
+                  onChange={(e) => setProviderApiKey(e.target.value)}
+                  placeholder={isKeylessType ? "بدون کلید" : "sk-..."}
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-blue-600 focus:outline-none disabled:bg-slate-100 disabled:text-slate-400"
                 />
               </div>
             </div>
@@ -363,11 +473,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
 
             <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
               <p className="text-[11px] text-slate-500 leading-relaxed max-w-lg">
-                احراز هویت این سرویس به‌صورت امن فقط از سمت سرور و از متغیر محیطی{" "}
+                کلید واردشده همراه تنظیمات ذخیره می‌شود و فقط در درخواست‌های سمت سرور استفاده می‌شود. اگر خالی بگذارید، از متغیر محیطی{" "}
                 <code className="font-mono text-slate-700">
                   {PROVIDER_PRESETS[providerType].envVar}
                 </code>{" "}
-                (یا <code className="font-mono text-slate-700">CUSTOM_AI_API_KEY</code>) خوانده می‌شود.
+                روی سرور خوانده می‌شود.
               </p>
 
               <button

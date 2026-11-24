@@ -1,7 +1,7 @@
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import type { EnrichmentSettings, ProductSource, ProductSpec } from "../src/types/product.ts";
 import {
-  generateJsonWithExternalProvider,
+  generateJsonWithAutoFallback,
   resolveActiveCustomProvider,
 } from "./aiProvider.ts";
 import { searchWebProductImages } from "./imagePipeline.ts";
@@ -15,12 +15,19 @@ let lastHealthyModel: string | null = null;
 
 interface ModelCandidate {
   id: string;
-  thinkingLevel?: ThinkingLevel;
 }
 
+// All of these are free-tier models on the Gemini Developer API.
+// Order is quality-first, then cheaper/higher-quota models as automatic failover.
 const TEXT_MODEL_POOL: ModelCandidate[] = [
-  { id: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW },
-  { id: "gemini-3.1-flash-lite", thinkingLevel: ThinkingLevel.MINIMAL },
+  { id: "gemini-3.8-flash" },
+  { id: "gemini-3.6-flash" },
+  { id: "gemini-3.5-flash-lite" },
+  { id: "gemini-4-hydrogen" },
+  { id: "gemini-3.1-flash-lite" },
+  { id: "gemma-4-31b-it" },
+  { id: "gemma-4-26b-a4b-it" },
+  { id: "gemini-2.5-flash" },
 ];
 
 const PERMANENT_SKIP_MS = 15 * 60 * 1000;
@@ -119,14 +126,31 @@ function isAuthOrFatalError(err: unknown): boolean {
   return (
     msg.includes("API_KEY_INVALID") ||
     msg.includes("PERMISSION_DENIED") ||
-    msg.includes("403") ||
-    msg.includes("INVALID_ARGUMENT")
+    msg.includes("UNAUTHENTICATED") ||
+    msg.includes("API key not valid") ||
+    msg.includes("401") ||
+    msg.includes("403")
   );
 }
 
 function isNotFoundError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.includes("NOT_FOUND") || msg.includes("404");
+}
+
+function isModelConfigError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes("INVALID_ARGUMENT") ||
+    msg.includes("FAILED_PRECONDITION") ||
+    msg.includes("400")
+  );
+}
+
+function hasGeminiCredentials(settings?: EnrichmentSettings): boolean {
+  return Boolean(
+    (settings?.geminiApiKey || "").trim() || (process.env.GEMINI_API_KEY || "").trim()
+  );
 }
 
 function isQuotaError(err: unknown): boolean {
@@ -153,7 +177,12 @@ function isBusyOrTransientError(err: unknown): boolean {
 }
 
 function isRetryableModelError(err: unknown): boolean {
-  return isNotFoundError(err) || isQuotaError(err) || isBusyOrTransientError(err);
+  return (
+    isNotFoundError(err) ||
+    isModelConfigError(err) ||
+    isQuotaError(err) ||
+    isBusyOrTransientError(err)
+  );
 }
 
 function getOrderedModelPool(includeCooledDown: boolean): ModelCandidate[] {
@@ -219,9 +248,6 @@ async function invokeCandidate(
         contents,
         config: {
           ...(jsonMode ? { responseMimeType: "application/json" } : {}),
-          ...(candidate.thinkingLevel
-            ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
-            : {}),
         },
       },
       timeoutMs
@@ -231,7 +257,7 @@ async function invokeCandidate(
     lastHealthyModel = candidate.id;
     return response;
   } catch (err) {
-    if (isNotFoundError(err)) {
+    if (isNotFoundError(err) || isModelConfigError(err)) {
       modelCooldownUntil.set(candidate.id, Date.now() + PERMANENT_SKIP_MS);
       if (lastHealthyModel === candidate.id) lastHealthyModel = null;
     } else if (isQuotaError(err) || isBusyOrTransientError(err)) {
@@ -388,8 +414,6 @@ export async function researchProductWithGemini(
     seedUrl?: string;
   }
 ): Promise<GeminiProductResearchResult> {
-  const ai = getGeminiClient(settings.geminiApiKey);
-
   const toneGuide =
     settings.tone === "technical"
       ? "لحن دقیق، فنی و مهندسی با تمرکز بر مشخصات سخت‌افزاری، دقت سنجش، استانداردها و اعداد واقعی"
@@ -487,80 +511,96 @@ ${extraWebContext ? `\nنتایج به‌دست‌آمده از جستجوی و�
         }
       : promptText;
 
-  let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
-  let parsed: Record<string, unknown> | null = null;
-  let fallbackContext: LiveFallbackWebContext | null = null;
+  type GenerateContentResult = Awaited<
+    ReturnType<GoogleGenAI["models"]["generateContent"]>
+  >;
 
-  const activeCustomProvider = resolveActiveCustomProvider(settings);
+  const responseBox: { value: GenerateContentResult | null } = { value: null };
+  const parsedBox: { value: Record<string, unknown> | null } = { value: null };
+  const contextBox: { value: LiveFallbackWebContext | null } = { value: null };
+  let lastError: unknown = null;
 
-  if (activeCustomProvider) {
-    fallbackContext = await fetchLiveWebContextFallback(query);
-    const promptText = buildPrompt(fallbackContext.contextSummary);
-    const rawJsonText = await generateJsonWithExternalProvider({
-      provider: activeCustomProvider,
-      prompt: promptText,
+  const ai = hasGeminiCredentials(settings) ? getGeminiClient(settings.geminiApiKey) : null;
+  const externalFirst = Boolean(resolveActiveCustomProvider(settings));
+
+  const ensureFallbackContext = async (): Promise<LiveFallbackWebContext> => {
+    if (!contextBox.value) {
+      contextBox.value = await fetchLiveWebContextFallback(query);
+    }
+    return contextBox.value;
+  };
+
+  const tryExternalProvider = async (): Promise<boolean> => {
+    const context = await ensureFallbackContext();
+    const external = await generateJsonWithAutoFallback({
+      settings,
+      prompt: buildPrompt(context.contextSummary),
       imageBase64: options?.seedImageBase64,
       imageMimeType: "image/webp",
       timeoutMs: 45000,
+      totalBudgetMs: 60000,
+      needsVision: Boolean(options?.seedImageBase64),
+      validate: (text) => {
+        extractJsonObject(text);
+      },
     });
-    parsed = extractJsonObject(rawJsonText);
-  } else {
-    // Phase 1: Try Google Search grounding once if not in quota cooldown
-    if (Date.now() >= searchToolBlockedUntil) {
-      const searchModels = getOrderedModelPool(false).slice(0, 2);
-      for (const candidate of searchModels) {
-        if (Date.now() < searchToolBlockedUntil) break;
-        try {
-          const candidateResp = await callGenerateContentWithTimeout(
-            ai,
-            {
-              model: candidate.id,
-              contents: buildContents(buildPrompt()),
-              config: {
-                tools: [{ googleSearch: {} }],
-                ...(candidate.thinkingLevel
-                  ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
-                  : {}),
-              },
+    parsedBox.value = extractJsonObject(external.text);
+    return true;
+  };
+
+  const tryGeminiSearchGrounding = async (): Promise<boolean> => {
+    if (!ai || Date.now() < searchToolBlockedUntil) return false;
+
+    const searchModels = getOrderedModelPool(false).slice(0, 2);
+    for (const candidate of searchModels) {
+      if (Date.now() < searchToolBlockedUntil) break;
+      try {
+        const candidateResp = await callGenerateContentWithTimeout(
+          ai,
+          {
+            model: candidate.id,
+            contents: buildContents(buildPrompt()),
+            config: {
+              tools: [{ googleSearch: {} }],
             },
-            16000
-          );
-          parsed = extractJsonObject(candidateResp.text ?? "");
-          response = candidateResp;
-          modelCooldownUntil.delete(candidate.id);
-          lastHealthyModel = candidate.id;
-          break;
-        } catch (err) {
-          if (isAuthOrFatalError(err)) {
-            throw err;
-          }
-          if (isQuotaError(err)) {
-            // Search grounding quota exhausted (common on free tier): cool down search tool only
-            searchToolBlockedUntil = Date.now() + 15 * 60 * 1000;
-            break;
-          }
-          if (isNotFoundError(err)) {
-            modelCooldownUntil.set(candidate.id, Date.now() + PERMANENT_SKIP_MS);
-            continue;
-          }
-          if (isBusyOrTransientError(err)) {
-            modelCooldownUntil.set(candidate.id, Date.now() + BUSY_COOLDOWN_MS);
-            continue;
-          }
-          // JSON parse failure from search mode -> continue to structured JSON fallback below
+          },
+          16000
+        );
+        parsedBox.value = extractJsonObject(candidateResp.text ?? "");
+        responseBox.value = candidateResp;
+        modelCooldownUntil.delete(candidate.id);
+        lastHealthyModel = candidate.id;
+        return true;
+      } catch (err) {
+        lastError = err;
+        if (isQuotaError(err)) {
+          // Search grounding quota exhausted (common on free tier): cool down search only
+          searchToolBlockedUntil = Date.now() + 15 * 60 * 1000;
           break;
         }
+        if (isNotFoundError(err) || isModelConfigError(err)) {
+          modelCooldownUntil.set(candidate.id, Date.now() + PERMANENT_SKIP_MS);
+          continue;
+        }
+        if (isBusyOrTransientError(err)) {
+          modelCooldownUntil.set(candidate.id, Date.now() + BUSY_COOLDOWN_MS);
+          continue;
+        }
+        // Auth errors or invalid JSON from search mode fall through to structured mode
+        break;
       }
     }
+    return false;
+  };
 
-    // Phase 2: Live web context + resilient structured JSON generation across healthy models
-    if (!response || !parsed) {
-      fallbackContext = await fetchLiveWebContextFallback(query);
-      const promptText = buildPrompt(fallbackContext.contextSummary);
-      const contents = buildContents(promptText);
+  const tryGeminiStructuredJson = async (): Promise<boolean> => {
+    if (!ai) return false;
 
-      let parseError: unknown = null;
-      for (let parseTry = 0; parseTry < 2; parseTry++) {
+    const context = await ensureFallbackContext();
+    const contents = buildContents(buildPrompt(context.contextSummary));
+
+    for (let parseTry = 0; parseTry < 2; parseTry++) {
+      try {
         const candidateResp = await generateWithResilientModels({
           ai,
           contents,
@@ -569,24 +609,56 @@ ${extraWebContext ? `\nنتایج به‌دست‌آمده از جستجوی و�
           maxRounds: 2,
           totalBudgetMs: 40000,
         });
-        try {
-          parsed = extractJsonObject(candidateResp.text ?? "");
-          response = candidateResp;
-          break;
-        } catch (err) {
-          parseError = err;
-        }
+        parsedBox.value = extractJsonObject(candidateResp.text ?? "");
+        responseBox.value = candidateResp;
+        return true;
+      } catch (err) {
+        lastError = err;
       }
+    }
+    return false;
+  };
 
-      if (!response || !parsed) {
-        throw parseError instanceof Error
-          ? parseError
-          : new Error("پاسخ ساختاریافته از موتور پردازش دریافت نشد.");
-      }
+  const tryGemini = async (): Promise<boolean> => {
+    if (!ai) return false;
+    try {
+      if (await tryGeminiSearchGrounding()) return true;
+    } catch (err) {
+      lastError = err;
+    }
+    return tryGeminiStructuredJson();
+  };
+
+  if (externalFirst) {
+    try {
+      await tryExternalProvider();
+    } catch (err) {
+      lastError = err;
     }
   }
 
-  const groundingMeta = response?.candidates?.[0]?.groundingMetadata;
+  if (!parsedBox.value) {
+    await tryGemini();
+  }
+
+  if (!parsedBox.value) {
+    try {
+      await tryExternalProvider();
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (!parsedBox.value) {
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("پاسخ ساختاریافته از موتور پردازش دریافت نشد.");
+  }
+
+  const parsed = parsedBox.value;
+  const fallbackContext = contextBox.value;
+
+  const groundingMeta = responseBox.value?.candidates?.[0]?.groundingMetadata;
   const rawChunks = groundingMeta?.groundingChunks ?? [];
   const searchQueries = groundingMeta?.webSearchQueries ?? [];
 
@@ -711,9 +783,9 @@ export async function findMoreProductPagesWithGemini(
   productName: string,
   brand: string,
   isMedical = true,
-  apiKey?: string
+  settings?: EnrichmentSettings
 ): Promise<string[]> {
-  const ai = getGeminiClient(apiKey);
+  const ai = hasGeminiCredentials(settings) ? getGeminiClient(settings?.geminiApiKey) : null;
 
   const domainHint = isMedical
     ? "official medical device manufacturer product page, medical supply store, Amazon, or Digikala"
@@ -731,7 +803,7 @@ Return ONLY a JSON object:
 
   const urls = new Set<string>();
 
-  if (Date.now() >= searchToolBlockedUntil) {
+  if (ai && Date.now() >= searchToolBlockedUntil) {
     const modelsToTry = getOrderedModelPool(false).slice(0, 2);
     for (const candidate of modelsToTry) {
       if (Date.now() < searchToolBlockedUntil) break;
@@ -743,9 +815,6 @@ Return ONLY a JSON object:
             contents: prompt,
             config: {
               tools: [{ googleSearch: {} }],
-              ...(candidate.thinkingLevel
-                ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
-                : {}),
             },
           },
           15000
@@ -775,6 +844,31 @@ Return ONLY a JSON object:
     }
   }
 
+  const useExternal = urls.size === 0 && !ai;
+
+  if (urls.size === 0 && useExternal) {
+    try {
+      const external = await generateJsonWithAutoFallback({
+        settings,
+        prompt,
+        timeoutMs: 30000,
+        totalBudgetMs: 40000,
+        needsVision: false,
+        validate: (text) => {
+          extractJsonObject(text);
+        },
+      });
+      const parsed = extractJsonObject(external.text);
+      if (Array.isArray(parsed.urls)) {
+        for (const u of parsed.urls) {
+          if (typeof u === "string" && u.startsWith("http")) urls.add(u);
+        }
+      }
+    } catch {
+      // Fall through to live web search below
+    }
+  }
+
   // Fallback to live web search pages if Gemini search grounding is unavailable or empty
   if (urls.size === 0) {
     const live = await fetchLiveWebContextFallback(productName);
@@ -790,7 +884,7 @@ export async function extractProductListFromScan(params: {
   isMedical?: boolean;
   settings?: EnrichmentSettings;
 }): Promise<{ items: string[]; note?: string }> {
-  const ai = getGeminiClient(params.settings?.geminiApiKey);
+  const ai = hasGeminiCredentials(params.settings) ? getGeminiClient(params.settings?.geminiApiKey) : null;
   const domainNote = params.isMedical
     ? "این برگه مربوط به لیست تجهیزات پزشکی و سلامت است؛ نام دستگاه، برند، مدل یا کد فنی (مثل BM28، YX306، سایز یا ظرفیت) را در صورت وجود در کنار نام کالا حفظ کن تا جستجو دقیق باشد."
     : "نام کالا، برند و کد مدل را در صورت وجود در کنار هم حفظ کن.";
@@ -815,36 +909,65 @@ export async function extractProductListFromScan(params: {
 `.trim();
 
   const activeCustomProvider = resolveActiveCustomProvider(params.settings);
-  let rawText = "{}";
+  const canUseExternal = Boolean(
+    activeCustomProvider || params.settings?.autoFreeFallback !== false
+  );
+  const isImageInput = params.mimeType.startsWith("image/");
 
-  if (activeCustomProvider && params.mimeType.startsWith("image/")) {
-    rawText = await generateJsonWithExternalProvider({
-      provider: activeCustomProvider,
+  if (!isImageInput && !ai) {
+    throw new Error(
+      "خواندن مستقیم فایل PDF فقط با کلید Gemini امکان‌پذیر است. لطفاً کلید Gemini را در تنظیمات وارد کنید یا فایل را به‌صورت عکس (JPG/PNG) ارسال کنید."
+    );
+  }
+
+  let rawText: string | null = null;
+
+  if (ai) {
+    try {
+      const response = await generateWithResilientModels({
+        ai,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: params.mimeType,
+                data: params.base64Data,
+              },
+            },
+            { text: prompt },
+          ],
+        },
+        jsonMode: true,
+        timeoutMs: 20000,
+        maxRounds: 1,
+        totalBudgetMs: 38000,
+      });
+      rawText = response.text ?? null;
+    } catch (err) {
+      if (!canUseExternal) throw err;
+    }
+  }
+
+  if (!rawText && canUseExternal) {
+    const external = await generateJsonWithAutoFallback({
+      settings: params.settings,
       prompt,
-      imageBase64: params.base64Data,
+      imageBase64: isImageInput ? params.base64Data : null,
       imageMimeType: params.mimeType,
       timeoutMs: 45000,
-    });
-  } else {
-    const response = await generateWithResilientModels({
-      ai,
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: params.mimeType,
-              data: params.base64Data,
-            },
-          },
-          { text: prompt },
-        ],
+      totalBudgetMs: 60000,
+      needsVision: isImageInput,
+      validate: (text) => {
+        extractJsonObject(text);
       },
-      jsonMode: true,
-      timeoutMs: 20000,
-      maxRounds: 1,
-      totalBudgetMs: 38000,
     });
-    rawText = response.text ?? "{}";
+    rawText = external.text;
+  }
+
+  if (!rawText) {
+    throw new Error(
+      "هیچ سرویس هوش مصنوعی در دسترس نیست. در تنظیمات یک کلید Gemini، OpenRouter یا Groq وارد کنید."
+    );
   }
 
   const parsed = extractJsonObject(rawText);
