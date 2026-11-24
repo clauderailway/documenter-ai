@@ -8,6 +8,7 @@ import {
   extractProductListFromScan,
   findMoreProductPagesWithGemini,
   researchProductWithGemini,
+  testGeminiKeys,
 } from "./server/gemini.ts";
 import {
   collectWebpImagesForProduct,
@@ -29,6 +30,14 @@ const PORT = Number(process.env.PORT || 3000);
 
 function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): EnrichmentSettings {
   const validTypes = new Set(["openrouter", "openai", "groq", "custom"]);
+  const validGeminiModes = new Set([
+    "auto_free",
+    "auto_quality",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-4-hydrogen",
+  ]);
   const rawProviders = Array.isArray(input?.customProviders) ? input.customProviders : [];
   const customProviders = rawProviders
     .slice(0, 20)
@@ -39,8 +48,11 @@ function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): Enric
       type: (validTypes.has(p.type) ? p.type : "custom") as EnrichmentSettings["customProviders"][number]["type"],
       baseUrl: typeof p.baseUrl === "string" ? p.baseUrl.trim().slice(0, 300) : "",
       model: typeof p.model === "string" ? p.model.trim().slice(0, 120) : "",
+      apiKey: typeof p.apiKey === "string" ? p.apiKey.trim().slice(0, 300) : "",
     }))
     .filter((p) => p.id && p.name && p.model);
+
+  const rawModelMode = typeof input?.geminiModelMode === "string" ? input.geminiModelMode.trim() : "";
 
   return {
     domainProfile: input?.domainProfile ?? DEFAULT_SETTINGS.domainProfile,
@@ -61,7 +73,11 @@ function sanitizeSettings(input: Partial<EnrichmentSettings> | undefined): Enric
         ? input.aiProviderId.trim().slice(0, 64)
         : DEFAULT_SETTINGS.aiProviderId,
     customProviders,
-    geminiApiKey: typeof input?.geminiApiKey === "string" ? input.geminiApiKey.trim().slice(0, 200) : "",
+    geminiApiKey: typeof input?.geminiApiKey === "string" ? input.geminiApiKey.trim().slice(0, 4000) : "",
+    geminiModelMode: (validGeminiModes.has(rawModelMode)
+      ? rawModelMode
+      : DEFAULT_SETTINGS.geminiModelMode) as EnrichmentSettings["geminiModelMode"],
+    freeTierSaver: input?.freeTierSaver !== false,
   };
 }
 
@@ -76,18 +92,24 @@ function csvEscape(value: string): string {
 function formatErrorMessage(err: unknown): { status: number; message: string; detail?: string } {
   console.error("[API Error]", err);
   const msg = err instanceof Error ? err.message : String(err);
-  if (msg.includes("API_KEY_INVALID") || msg.includes("PERMISSION_DENIED") || msg.includes("403")) {
+  if (
+    msg.includes("API_KEY_INVALID") ||
+    msg.includes("API key not valid") ||
+    msg.includes("PERMISSION_DENIED") ||
+    msg.includes("403")
+  ) {
     return {
       status: 403,
-      message: "کلید API در تنظیمات پروژه معتبر نیست یا دسترسی ندارد. لطفاً بخش Settings > Secrets را بررسی کنید.",
+      message:
+        "کلید API واردشده معتبر نیست یا دسترسی ندارد. لطفاً کلیدهای AI Studio خود را در بخش تنظیمات بررسی و تست کنید.",
       detail: msg,
     };
   }
-  if (msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota")) {
+  if (msg.includes("RESOURCE_EXHAUSTED") || msg.includes("429") || msg.toLowerCase().includes("quota")) {
     return {
       status: 429,
       message:
-        "سهمیه درخواست کلید API فعلی موقتاً پر شده است. چند لحظه صبر کنید یا در بخش Settings > Secrets یک کلید API دارای صورت‌حساب (Billing) انتخاب کنید.",
+        "سهمیه رایگان کلید فعلی موقتاً پر شده است. چند ثانیه صبر کنید یا در بخش تنظیمات یک یا چند کلید رایگان AI Studio دیگر اضافه کنید تا سیستم خودکار بین آن‌ها جابه‌جا شود.",
       detail: msg,
     };
   }
@@ -101,7 +123,7 @@ function formatErrorMessage(err: unknown): { status: number; message: string; de
     return {
       status: 503,
       message:
-        "سرویس پردازش در نسخه رایگان موقتاً بسیار شلوغ است (خطای 503 از سمت سرور مدل). چند لحظه بعد دوباره امتحان کنید یا در Settings > Secrets کلید API با ظرفیت بالاتر (Billing) متصل کنید.",
+        "سرور مدل موقتاً شلوغ است (خطای 503). چند لحظه بعد دوباره امتحان کنید یا در تنظیمات کلید رایگان AI Studio خود را وارد کرده و حالت «خودکار بهینه برای کلید رایگان» را انتخاب کنید.",
       detail: msg,
     };
   }
@@ -119,6 +141,17 @@ async function startServer() {
 
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
+  });
+
+  app.post("/api/ai/test-keys", async (req, res) => {
+    try {
+      const settings = sanitizeSettings(req.body?.settings);
+      const results = await testGeminiKeys(settings.geminiApiKey, settings.geminiModelMode);
+      res.json({ results });
+    } catch (err) {
+      const { status, message } = formatErrorMessage(err);
+      res.status(status).json({ error: message });
+    }
   });
 
   app.get("/api/webp/:filename", (req, res) => {
@@ -236,7 +269,8 @@ async function startServer() {
             research.titleEn || effectiveQuery,
             research.brand,
             settings.domainProfile === "medical",
-            settings.geminiApiKey
+            settings.geminiApiKey,
+            settings.freeTierSaver
           );
           const existingSet = new Set(pageUrls);
           const freshPages = extraPages.filter((u) => !existingSet.has(u));
@@ -307,7 +341,8 @@ async function startServer() {
         productName,
         brand,
         settings.domainProfile === "medical",
-        settings.geminiApiKey
+        settings.geminiApiKey,
+        settings.freeTierSaver
       );
       const images = await collectWebpImagesForProduct({
         pageUrls: pages,

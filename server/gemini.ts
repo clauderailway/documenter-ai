@@ -1,5 +1,11 @@
+import crypto from "node:crypto";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
-import type { EnrichmentSettings, ProductSource, ProductSpec } from "../src/types/product.ts";
+import type {
+  EnrichmentSettings,
+  GeminiModelMode,
+  ProductSource,
+  ProductSpec,
+} from "../src/types/product.ts";
 import {
   generateJsonWithExternalProvider,
   resolveActiveCustomProvider,
@@ -8,49 +14,337 @@ import { searchWebProductImages } from "./imagePipeline.ts";
 
 let searchToolBlockedUntil = 0;
 
-// Track per-model temporary cooldowns when a specific pool returns 503/429/404
-// so consecutive batch items immediately route to a healthy responsive model.
-const modelCooldownUntil = new Map<string, number>();
-let lastHealthyModel: string | null = null;
+// Track per-(keyTag, modelId) temporary cooldowns so one key's rate limit never blocks another key
+const keyModelCooldownUntil = new Map<string, number>();
+const lastHealthyModelByKey = new Map<string, string>();
+const modelsWithoutThinkingConfig = new Set<string>();
+const clientCache = new Map<string, GoogleGenAI>();
+let roundRobinKeyCursor = 0;
+
+const discoveredModelsByKey = new Map<string, { expiresAt: number; models: ModelCandidate[] }>();
 
 interface ModelCandidate {
   id: string;
   thinkingLevel?: ThinkingLevel;
+  supportsJsonMode?: boolean;
 }
 
-const TEXT_MODEL_POOL: ModelCandidate[] = [
-  { id: "gemini-4-hydrogen", thinkingLevel: ThinkingLevel.LOW },
-  { id: "gemini-3.1-flash-lite", thinkingLevel: ThinkingLevel.MINIMAL },
+function inferDefaultThinkingLevel(modelId: string): ThinkingLevel | undefined {
+  const lower = modelId.toLowerCase();
+  if (lower.startsWith("gemma-") || lower.startsWith("gemini-2.5")) return undefined;
+  if (lower.includes("flash-lite")) return ThinkingLevel.MINIMAL;
+  if (lower.startsWith("gemini-4") || lower.startsWith("gemini-3")) return ThinkingLevel.LOW;
+  return undefined;
+}
+
+const ALL_GEMINI_MODELS: Record<string, ModelCandidate> = {
+  "gemini-3.5-flash-lite": {
+    id: "gemini-3.5-flash-lite",
+    thinkingLevel: ThinkingLevel.MINIMAL,
+    supportsJsonMode: true,
+  },
+  "gemini-3.1-flash-lite": {
+    id: "gemini-3.1-flash-lite",
+    thinkingLevel: ThinkingLevel.MINIMAL,
+    supportsJsonMode: true,
+  },
+  "gemini-flash-lite-latest": {
+    id: "gemini-flash-lite-latest",
+    supportsJsonMode: true,
+  },
+  "gemma-4-31b-it": {
+    id: "gemma-4-31b-it",
+    supportsJsonMode: false,
+  },
+  "gemma-4-26b-a4b-it": {
+    id: "gemma-4-26b-a4b-it",
+    supportsJsonMode: false,
+  },
+  "gemini-flash-latest": {
+    id: "gemini-flash-latest",
+    supportsJsonMode: true,
+  },
+  "gemini-4-hydrogen": {
+    id: "gemini-4-hydrogen",
+    thinkingLevel: ThinkingLevel.LOW,
+    supportsJsonMode: true,
+  },
+};
+
+const FREE_PRIORITY_ORDER = [
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-flash-lite-latest",
+  "gemma-4-31b-it",
+  "gemini-flash-latest",
+  "gemini-4-hydrogen",
 ];
 
-const PERMANENT_SKIP_MS = 15 * 60 * 1000;
-const BUSY_COOLDOWN_MS = 90 * 1000;
+const QUALITY_PRIORITY_ORDER = [
+  "gemini-4-hydrogen",
+  "gemini-flash-latest",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemma-4-31b-it",
+  "gemini-flash-lite-latest",
+];
 
-let aiClient: GoogleGenAI | null = null;
+function isDisallowedModelId(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  if (
+    lower.startsWith("gemini-1.5") ||
+    lower.startsWith("gemini-2.0") ||
+    lower.startsWith("gemini-2.5") ||
+    lower === "gemini-pro" ||
+    lower.startsWith("gemini-1.0")
+  ) {
+    return true;
+  }
+  if (
+    lower.includes("embedding") ||
+    lower.includes("tts") ||
+    lower.includes("image") ||
+    lower.includes("imagen") ||
+    lower.includes("veo") ||
+    lower.includes("lyria") ||
+    lower.includes("audio") ||
+    lower.includes("live") ||
+    lower.includes("aqa") ||
+    lower.includes("transcribe") ||
+    lower.includes("translate") ||
+    lower.includes("decision") ||
+    lower.includes("genie") ||
+    lower.includes("robotics") ||
+    lower.includes("computer-use") ||
+    lower.includes("deep-research") ||
+    lower.includes("nano-banana") ||
+    lower.includes("omni") ||
+    lower.includes("-pro") ||
+    lower.includes("neon") ||
+    lower.includes("carbon") ||
+    lower.includes("argon")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function scoreDiscoveredModel(modelId: string, preferFree = true): number {
+  const lower = modelId.toLowerCase();
+  if (preferFree) {
+    if (lower === "gemini-3.5-flash-lite") return 100;
+    if (lower === "gemini-3.1-flash-lite") return 99;
+    if (lower === "gemini-3.1-flash-lite-preview") return 98;
+    if (lower === "gemini-flash-lite-latest") return 97;
+    if (lower === "gemini-3.8-flash-lite") return 96;
+    if (lower.includes("flash-lite") && !lower.startsWith("gemini-2.5")) return 95;
+    if (lower === "gemma-4-31b-it") return 93;
+    if (lower === "gemma-4-26b-a4b-it") return 92;
+    if (lower.startsWith("gemma-4")) return 91;
+    if (lower === "gemini-3-flash-preview") return 89;
+    if (lower === "gemini-flash-latest") return 88;
+    if (lower === "gemini-3.5-flash") return 86;
+    if (lower === "gemini-3.8-flash") return 85;
+    if (lower === "gemini-4-hydrogen") return 84;
+    if (lower === "gemini-3.7-flash") return 83;
+    if (lower === "gemini-3.6-flash") return 82;
+    if (lower.includes("flash") && !lower.startsWith("gemini-2.5")) return 80;
+    if (lower === "gemma-3-27b-it") return 76;
+    if (lower === "gemma-3-12b-it") return 74;
+    if (lower.startsWith("gemma-3") && !lower.includes("1b")) return 70;
+    if (lower === "gemini-2.5-flash-lite") return 38;
+    if (lower === "gemini-2.5-flash") return 35;
+    return 10;
+  }
+
+  if (lower === "gemini-4-hydrogen") return 100;
+  if (lower === "gemini-3.8-flash") return 98;
+  if (lower === "gemini-3.7-flash") return 96;
+  if (lower === "gemini-3.6-flash") return 95;
+  if (lower === "gemini-3.5-flash") return 94;
+  if (lower === "gemini-3-flash-preview") return 92;
+  if (lower === "gemini-flash-latest") return 91;
+  if (lower === "gemini-3.5-flash-lite") return 89;
+  if (lower === "gemini-3.1-flash-lite") return 88;
+  if (lower.startsWith("gemini-3.1-flash-lite")) return 87;
+  if (lower === "gemini-flash-lite-latest") return 86;
+  if (lower === "gemma-4-31b-it") return 84;
+  if (lower === "gemma-4-26b-a4b-it") return 83;
+  if (lower.startsWith("gemma-4")) return 82;
+  if (lower.includes("flash") && !lower.startsWith("gemini-2.5")) return 80;
+  if (lower === "gemma-3-27b-it") return 74;
+  if (lower === "gemini-2.5-flash") return 40;
+  if (lower === "gemini-2.5-flash-lite") return 38;
+  return 10;
+}
+
+function getModelFamilyBucket(modelId: string): string {
+  const lower = modelId.toLowerCase();
+  if (lower.startsWith("gemma-")) return "gemma";
+  if (lower.includes("flash-lite")) return "flash-lite";
+  if (lower.includes("-latest")) return "latest";
+  if (lower.startsWith("gemini-4")) return "gen4";
+  return "flash";
+}
+
+function interleaveByFamily(models: ModelCandidate[]): ModelCandidate[] {
+  const buckets = new Map<string, ModelCandidate[]>();
+  for (const m of models) {
+    const key = getModelFamilyBucket(m.id);
+    const list = buckets.get(key) ?? [];
+    list.push(m);
+    buckets.set(key, list);
+  }
+  const result: ModelCandidate[] = [];
+  let added = true;
+  while (added) {
+    added = false;
+    for (const list of buckets.values()) {
+      const next = list.shift();
+      if (next) {
+        result.push(next);
+        added = true;
+      }
+    }
+  }
+  return result;
+}
+
+async function discoverAvailableModelsForKey(
+  apiKey: string,
+  keyTag: string
+): Promise<ModelCandidate[]> {
+  const now = Date.now();
+  const cached = discoveredModelsByKey.get(keyTag);
+  if (cached && now < cached.expiresAt) {
+    return cached.models;
+  }
+
+  try {
+    const res = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+      {
+        headers: {
+          "x-goog-api-key": apiKey,
+        },
+        signal: AbortSignal.timeout(5000),
+      }
+    );
+    if (!res.ok) {
+      return [];
+    }
+    const data = (await res.json()) as {
+      models?: Array<{
+        name?: string;
+        supportedGenerationMethods?: string[];
+      }>;
+    };
+    const found: ModelCandidate[] = [];
+    for (const m of data.models ?? []) {
+      const methods = m.supportedGenerationMethods ?? [];
+      if (!methods.includes("generateContent")) continue;
+      const id = (m.name || "").replace(/^models\//, "").trim();
+      if (!id || isDisallowedModelId(id)) continue;
+      const known = ALL_GEMINI_MODELS[id];
+      if (known) {
+        found.push(known);
+      } else {
+        const lower = id.toLowerCase();
+        if (lower.startsWith("gemini-") || lower.startsWith("gemma-")) {
+          found.push({
+            id,
+            thinkingLevel: inferDefaultThinkingLevel(id),
+            supportsJsonMode: !lower.startsWith("gemma-"),
+          });
+        }
+      }
+    }
+    found.sort((a, b) => scoreDiscoveredModel(b.id, true) - scoreDiscoveredModel(a.id, true));
+    const top = found.slice(0, 16);
+    discoveredModelsByKey.set(keyTag, {
+      expiresAt: now + 10 * 60 * 1000,
+      models: top,
+    });
+    return top;
+  } catch {
+    return [];
+  }
+}
+
+const PERMANENT_SKIP_MS = 15 * 60 * 1000;
+const QUOTA_COOLDOWN_MS = 65 * 1000;
+const BUSY_COOLDOWN_MS = 15 * 1000;
+
+export function parseGeminiApiKeys(raw?: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  if (typeof raw === "string" && raw.trim()) {
+    const parts = raw
+      .split(/[\r\n,;\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 10);
+    for (const k of parts) {
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(k);
+      }
+    }
+  }
+  return out.slice(0, 20);
+}
+
+function getKeyTag(apiKey: string): string {
+  return crypto.createHash("sha256").update(apiKey).digest("hex").slice(0, 10);
+}
+
+export function maskApiKey(apiKey: string): string {
+  const clean = apiKey.trim();
+  if (clean.length <= 10) return "****";
+  return `${clean.slice(0, 6)}...${clean.slice(-4)}`;
+}
+
+function resolveEffectiveKeyPool(rawUserKeys?: string): Array<{ key: string; tag: string; isServerDefault: boolean }> {
+  const userKeys = parseGeminiApiKeys(rawUserKeys);
+  if (userKeys.length > 0) {
+    return userKeys.map((key) => ({ key, tag: getKeyTag(key), isServerDefault: false }));
+  }
+  const serverKey = (process.env.GEMINI_API_KEY || "").trim();
+  if (serverKey) {
+    return [{ key: serverKey, tag: "server-default", isServerDefault: true }];
+  }
+  return [];
+}
+
+function getOrderedKeyPool(rawUserKeys?: string): Array<{ key: string; tag: string; isServerDefault: boolean }> {
+  const pool = resolveEffectiveKeyPool(rawUserKeys);
+  if (pool.length <= 1) return pool;
+  const start = roundRobinKeyCursor % pool.length;
+  roundRobinKeyCursor = (roundRobinKeyCursor + 1) % pool.length;
+  return [...pool.slice(start), ...pool.slice(0, start)];
+}
 
 export function getGeminiClient(customApiKey?: string): GoogleGenAI {
-  const trimmedCustom = customApiKey?.trim();
-  if (trimmedCustom) {
-    return new GoogleGenAI({
-      apiKey: trimmedCustom,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
+  const resolvedKey = (customApiKey || process.env.GEMINI_API_KEY || "").trim();
+  const cacheKey = resolvedKey || "__default__";
+  const cached = clientCache.get(cacheKey);
+  if (cached) return cached;
+
+  const client = new GoogleGenAI({
+    apiKey: resolvedKey || undefined,
+    httpOptions: {
+      apiVersion: "v1beta",
+      headers: {
+        "User-Agent": "aistudio-build",
       },
-    });
+    },
+  });
+
+  if (clientCache.size > 40) {
+    const firstKey = clientCache.keys().next().value;
+    if (firstKey) clientCache.delete(firstKey);
   }
-  if (!aiClient) {
-    aiClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
-    });
-  }
-  return aiClient;
+  clientCache.set(cacheKey, client);
+  return client;
 }
 
 export interface GeminiProductResearchResult {
@@ -114,24 +408,35 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isAuthOrFatalError(err: unknown): boolean {
+function isInvalidApiKeyError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return (
     msg.includes("API_KEY_INVALID") ||
-    msg.includes("PERMISSION_DENIED") ||
-    msg.includes("403") ||
-    msg.includes("INVALID_ARGUMENT")
+    msg.includes("API key not valid") ||
+    msg.includes("API key expired") ||
+    msg.includes("API_KEY_EXPIRED")
   );
 }
 
-function isNotFoundError(err: unknown): boolean {
+function isModelConfigOrAccessError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes("NOT_FOUND") || msg.includes("404");
+  return (
+    msg.includes("NOT_FOUND") ||
+    msg.includes("404") ||
+    msg.includes("INVALID_ARGUMENT") ||
+    msg.includes("PERMISSION_DENIED") ||
+    msg.includes("403")
+  );
 }
 
 function isQuotaError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED") || msg.includes("quota");
+  return (
+    msg.includes("429") ||
+    msg.includes("RESOURCE_EXHAUSTED") ||
+    msg.toLowerCase().includes("quota") ||
+    msg.toLowerCase().includes("rate limit")
+  );
 }
 
 function isBusyOrTransientError(err: unknown): boolean {
@@ -152,17 +457,31 @@ function isBusyOrTransientError(err: unknown): boolean {
   );
 }
 
-function isRetryableModelError(err: unknown): boolean {
-  return isNotFoundError(err) || isQuotaError(err) || isBusyOrTransientError(err);
+function getBaseModelOrder(mode?: GeminiModelMode): ModelCandidate[] {
+  let ids: string[];
+  if (mode === "auto_quality") {
+    ids = [...QUALITY_PRIORITY_ORDER];
+  } else if (mode && mode !== "auto_free" && ALL_GEMINI_MODELS[mode]) {
+    ids = [mode, ...FREE_PRIORITY_ORDER.filter((id) => id !== mode)];
+  } else {
+    ids = [...FREE_PRIORITY_ORDER];
+  }
+  return ids.map((id) => ALL_GEMINI_MODELS[id]).filter(Boolean);
 }
 
-function getOrderedModelPool(includeCooledDown: boolean): ModelCandidate[] {
+function getOrderedModelPoolForKey(
+  keyTag: string,
+  mode: GeminiModelMode | undefined,
+  includeCooledDown: boolean
+): ModelCandidate[] {
   const now = Date.now();
-  const base = [...TEXT_MODEL_POOL];
+  const base = getBaseModelOrder(mode);
 
-  // Prioritize the last known responsive model so consecutive queue items succeed immediately
-  if (lastHealthyModel) {
-    const idx = base.findIndex((m) => m.id === lastHealthyModel);
+  // If user didn't pin a specific model, prioritize the last known healthy model for this key
+  const isPinned = Boolean(mode && mode !== "auto_free" && mode !== "auto_quality");
+  const lastHealthy = lastHealthyModelByKey.get(keyTag);
+  if (!isPinned && lastHealthy) {
+    const idx = base.findIndex((m) => m.id === lastHealthy);
     if (idx > 0) {
       const [healthy] = base.splice(idx, 1);
       base.unshift(healthy);
@@ -173,10 +492,10 @@ function getOrderedModelPool(includeCooledDown: boolean): ModelCandidate[] {
   const cooledBusy: ModelCandidate[] = [];
 
   for (const m of base) {
-    const until = modelCooldownUntil.get(m.id) ?? 0;
+    const until = keyModelCooldownUntil.get(`${keyTag}:${m.id}`) ?? 0;
     if (now >= until) {
       ready.push(m);
-    } else if (includeCooledDown && until - now <= BUSY_COOLDOWN_MS + 5000) {
+    } else if (includeCooledDown && until - now <= Math.max(QUOTA_COOLDOWN_MS, BUSY_COOLDOWN_MS) + 5000) {
       cooledBusy.push(m);
     }
   }
@@ -206,20 +525,26 @@ async function callGenerateContentWithTimeout(
 
 async function invokeCandidate(
   ai: GoogleGenAI,
+  keyTag: string,
   candidate: ModelCandidate,
   contents: Parameters<GoogleGenAI["models"]["generateContent"]>[0]["contents"],
   jsonMode: boolean,
   timeoutMs: number
 ): Promise<Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>> {
-  try {
-    const response = await callGenerateContentWithTimeout(
+  const cdKey = `${keyTag}:${candidate.id}`;
+  const useJsonMime = jsonMode && candidate.supportsJsonMode !== false;
+  const wantThinking =
+    Boolean(candidate.thinkingLevel) && !modelsWithoutThinkingConfig.has(candidate.id);
+
+  const runCall = (includeThinking: boolean) =>
+    callGenerateContentWithTimeout(
       ai,
       {
         model: candidate.id,
         contents,
         config: {
-          ...(jsonMode ? { responseMimeType: "application/json" } : {}),
-          ...(candidate.thinkingLevel
+          ...(useJsonMime ? { responseMimeType: "application/json" } : {}),
+          ...(includeThinking && candidate.thinkingLevel
             ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
             : {}),
         },
@@ -227,23 +552,161 @@ async function invokeCandidate(
       timeoutMs
     );
 
-    modelCooldownUntil.delete(candidate.id);
-    lastHealthyModel = candidate.id;
+  try {
+    let response: Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>;
+    try {
+      response = await runCall(wantThinking);
+    } catch (innerErr) {
+      const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+      if (wantThinking && innerMsg.includes("INVALID_ARGUMENT")) {
+        modelsWithoutThinkingConfig.add(candidate.id);
+        response = await runCall(false);
+      } else {
+        throw innerErr;
+      }
+    }
+
+    keyModelCooldownUntil.delete(cdKey);
+    lastHealthyModelByKey.set(keyTag, candidate.id);
     return response;
   } catch (err) {
-    if (isNotFoundError(err)) {
-      modelCooldownUntil.set(candidate.id, Date.now() + PERMANENT_SKIP_MS);
-      if (lastHealthyModel === candidate.id) lastHealthyModel = null;
-    } else if (isQuotaError(err) || isBusyOrTransientError(err)) {
-      modelCooldownUntil.set(candidate.id, Date.now() + BUSY_COOLDOWN_MS);
-      if (lastHealthyModel === candidate.id) lastHealthyModel = null;
+    if (isInvalidApiKeyError(err)) {
+      // Do not poison model cooldowns on other keys
+      throw err;
+    }
+    if (isModelConfigOrAccessError(err)) {
+      keyModelCooldownUntil.set(cdKey, Date.now() + PERMANENT_SKIP_MS);
+      if (lastHealthyModelByKey.get(keyTag) === candidate.id) {
+        lastHealthyModelByKey.delete(keyTag);
+      }
+    } else if (isQuotaError(err)) {
+      keyModelCooldownUntil.set(cdKey, Date.now() + QUOTA_COOLDOWN_MS);
+      if (lastHealthyModelByKey.get(keyTag) === candidate.id) {
+        lastHealthyModelByKey.delete(keyTag);
+      }
+    } else if (isBusyOrTransientError(err)) {
+      keyModelCooldownUntil.set(cdKey, Date.now() + BUSY_COOLDOWN_MS);
+      if (lastHealthyModelByKey.get(keyTag) === candidate.id) {
+        lastHealthyModelByKey.delete(keyTag);
+      }
     }
     throw err;
   }
 }
 
-async function generateWithResilientModels(options: {
+function raceCandidatesWithConcurrency(params: {
   ai: GoogleGenAI;
+  keyTag: string;
+  candidates: ModelCandidate[];
+  contents: Parameters<GoogleGenAI["models"]["generateContent"]>[0]["contents"];
+  jsonMode: boolean;
+  concurrency: number;
+  deadline: number;
+  perModelTimeoutMs: number;
+}): Promise<Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>> {
+  const {
+    ai,
+    keyTag,
+    candidates,
+    contents,
+    jsonMode,
+    concurrency,
+    deadline,
+    perModelTimeoutMs,
+  } = params;
+
+  return new Promise((resolve, reject) => {
+    if (candidates.length === 0) {
+      reject(new Error("503 UNAVAILABLE: هیچ مدل فعالی برای اجرا باقی نماند."));
+      return;
+    }
+
+    let nextIndex = 0;
+    let inFlight = 0;
+    let settled = false;
+    let sawInvalidKey = false;
+    let lastError: unknown = null;
+
+    const remainingTotal = Math.max(1000, deadline - Date.now());
+    const deadlineTimer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        reject(
+          lastError instanceof Error
+            ? lastError
+            : new Error(`UPSTREAM_TIMEOUT_${remainingTotal}MS`)
+        );
+      }
+    }, remainingTotal);
+
+    const finishSuccess = (
+      resp: Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>
+    ) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      resolve(resp);
+    };
+
+    const finishFailure = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      reject(
+        lastError instanceof Error
+          ? lastError
+          : new Error("503 UNAVAILABLE: امکان دریافت پاسخ از سرویس پردازش وجود نداشت.")
+      );
+    };
+
+    const launchNext = () => {
+      while (
+        !settled &&
+        !sawInvalidKey &&
+        inFlight < concurrency &&
+        nextIndex < candidates.length
+      ) {
+        const rem = deadline - Date.now();
+        if (rem < 3500) break;
+
+        const candidate = candidates[nextIndex++];
+        inFlight++;
+        const callTimeout = Math.min(perModelTimeoutMs, Math.max(4000, rem - 400));
+
+        invokeCandidate(ai, keyTag, candidate, contents, jsonMode, callTimeout)
+          .then((resp) => {
+            inFlight--;
+            finishSuccess(resp);
+          })
+          .catch((err) => {
+            inFlight--;
+            lastError = err;
+            if (isInvalidApiKeyError(err)) {
+              sawInvalidKey = true;
+            }
+            if (!settled) {
+              if (!sawInvalidKey && nextIndex < candidates.length && deadline - Date.now() >= 3500) {
+                launchNext();
+              }
+              if (inFlight === 0) {
+                finishFailure();
+              }
+            }
+          });
+      }
+
+      if (!settled && inFlight === 0) {
+        finishFailure();
+      }
+    };
+
+    launchNext();
+  });
+}
+
+async function generateWithResilientModels(options: {
+  rawApiKeys?: string;
+  modelMode?: GeminiModelMode;
   contents: Parameters<GoogleGenAI["models"]["generateContent"]>[0]["contents"];
   jsonMode: boolean;
   timeoutMs: number;
@@ -251,45 +714,140 @@ async function generateWithResilientModels(options: {
   totalBudgetMs?: number;
 }): Promise<Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>> {
   const {
-    ai,
+    rawApiKeys,
+    modelMode,
     contents,
     jsonMode,
     timeoutMs,
     maxRounds = 2,
-    totalBudgetMs = 42000,
+    totalBudgetMs = 45000,
   } = options;
+
+  const keyPool = getOrderedKeyPool(rawApiKeys);
+  if (keyPool.length === 0) {
+    throw new Error("API_KEY_INVALID: هیچ کلید API فعالی یافت نشد. لطفاً کلید AI Studio رایگان خود را در تنظیمات وارد کنید.");
+  }
+
   const deadline = Date.now() + totalBudgetMs;
+  const invalidKeyTags = new Set<string>();
+  const preferFree = modelMode !== "auto_quality";
   let lastError: unknown = null;
 
   for (let round = 0; round < maxRounds; round++) {
     if (Date.now() >= deadline - 1500) break;
 
-    const candidates = getOrderedModelPool(round > 0);
-    const listToTry = candidates.length > 0 ? candidates : getOrderedModelPool(true);
-    if (listToTry.length === 0) break;
+    for (const keyEntry of keyPool) {
+      if (invalidKeyTags.has(keyEntry.tag)) continue;
+      if (Date.now() >= deadline - 2500) break;
 
-    for (let i = 0; i < listToTry.length; i++) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs < 3000) break;
+      const ai = getGeminiClient(keyEntry.key);
+      const baseCandidates = getOrderedModelPoolForKey(keyEntry.tag, modelMode, round > 0);
+      const baseList =
+        baseCandidates.length > 0
+          ? baseCandidates
+          : getOrderedModelPoolForKey(keyEntry.tag, modelMode, true);
 
-      const candidate = listToTry[i];
-      const attemptTimeout = Math.min(timeoutMs, Math.max(5000, remainingMs - 500));
-      try {
-        return await invokeCandidate(ai, candidate, contents, jsonMode, attemptTimeout);
-      } catch (err) {
-        lastError = err;
-        if (isAuthOrFatalError(err) || !isRetryableModelError(err)) {
-          throw err;
+      // Merge dynamically discovered models for this key, sorted for the selected mode
+      const discoveredRaw = await discoverAvailableModelsForKey(keyEntry.key, keyEntry.tag);
+      const discovered = [...discoveredRaw].sort(
+        (a, b) => scoreDiscoveredModel(b.id, preferFree) - scoreDiscoveredModel(a.id, preferFree)
+      );
+      const now = Date.now();
+      const mergedMap = new Map<string, ModelCandidate>();
+
+      const lastHealthyId = lastHealthyModelByKey.get(keyEntry.tag);
+      const isPinned = Boolean(modelMode && modelMode !== "auto_free" && modelMode !== "auto_quality");
+      if (!isPinned && lastHealthyId) {
+        const match =
+          discovered.find((m) => m.id === lastHealthyId) ||
+          baseList.find((m) => m.id === lastHealthyId);
+        if (match && (round > 0 || now >= (keyModelCooldownUntil.get(`${keyEntry.tag}:${match.id}`) ?? 0))) {
+          mergedMap.set(match.id, match);
         }
-        // Small jittered pause before next fallback model to avoid burst load-shedding
-        if (i < listToTry.length - 1 && deadline - Date.now() > 4000) {
-          await sleep(300 + Math.floor(Math.random() * 200));
+      }
+
+      if (isPinned) {
+        for (const m of baseList) mergedMap.set(m.id, m);
+        for (const m of discovered) {
+          if (!mergedMap.has(m.id) && (round > 0 || now >= (keyModelCooldownUntil.get(`${keyEntry.tag}:${m.id}`) ?? 0))) {
+            mergedMap.set(m.id, m);
+          }
+        }
+      } else {
+        for (const m of discovered) {
+          if (!mergedMap.has(m.id) && (round > 0 || now >= (keyModelCooldownUntil.get(`${keyEntry.tag}:${m.id}`) ?? 0))) {
+            mergedMap.set(m.id, m);
+          }
+        }
+        for (const m of baseList) {
+          if (!mergedMap.has(m.id)) mergedMap.set(m.id, m);
+        }
+      }
+
+      const listToTry = Array.from(mergedMap.values());
+      if (listToTry.length === 0) continue;
+
+      // 1) Try the primary / last-known-healthy model first (single call to conserve free quota)
+      const primary = listToTry[0];
+      const primaryRem = deadline - Date.now();
+      if (primary && primaryRem >= 4000) {
+        try {
+          return await invokeCandidate(
+            ai,
+            keyEntry.tag,
+            primary,
+            contents,
+            jsonMode,
+            Math.min(Math.max(timeoutMs, 24000), primaryRem - 500)
+          );
+        } catch (err) {
+          lastError = err;
+          if (isInvalidApiKeyError(err)) {
+            invalidKeyTags.add(keyEntry.tag);
+            continue;
+          }
+          if (
+            !isModelConfigOrAccessError(err) &&
+            !isQuotaError(err) &&
+            !isBusyOrTransientError(err)
+          ) {
+            throw err;
+          }
+        }
+      }
+
+      // 2) Primary failed (503/429/404/timeout): run a sliding concurrency pool across diverse model families.
+      // Fast 503/404/429 errors immediately refill their slot; accepted generating models get up to 38s to complete.
+      const remaining = interleaveByFamily(listToTry.slice(1));
+      if (remaining.length > 0 && deadline - Date.now() >= 4000) {
+        const keyShareDeadline =
+          keyPool.length > 1
+            ? Math.min(deadline, Date.now() + Math.max(18000, Math.floor((deadline - Date.now()) / 2)))
+            : deadline;
+        try {
+          return await raceCandidatesWithConcurrency({
+            ai,
+            keyTag: keyEntry.tag,
+            candidates: remaining,
+            contents,
+            jsonMode,
+            concurrency: 4,
+            deadline: keyShareDeadline,
+            perModelTimeoutMs: Math.max(timeoutMs, 38000),
+          });
+        } catch (err) {
+          lastError = err;
+          if (isInvalidApiKeyError(err)) {
+            invalidKeyTags.add(keyEntry.tag);
+          }
         }
       }
     }
 
+    if (invalidKeyTags.size >= keyPool.length) break;
+
     if (round < maxRounds - 1 && deadline - Date.now() > 6000) {
-      const backoffMs = 1200 + Math.floor(Math.random() * 500);
+      const backoffMs = 500 + Math.floor(Math.random() * 300);
       await sleep(backoffMs);
     }
   }
@@ -297,6 +855,142 @@ async function generateWithResilientModels(options: {
   throw lastError instanceof Error
     ? lastError
     : new Error("503 UNAVAILABLE: امکان دریافت پاسخ از سرویس پردازش وجود نداشت.");
+}
+
+export interface KeyTestResult {
+  maskedKey: string;
+  isServerDefault: boolean;
+  ok: boolean;
+  workingModel?: string;
+  availableModels?: string[];
+  error?: string;
+  detail?: string;
+}
+
+function summarizeRawError(msg: string): string {
+  const codeMatch = msg.match(/"code"\s*:\s*(\d+)/) || msg.match(/\b(400|401|403|404|429|500|502|503|504)\b/);
+  const statusMatch = msg.match(/"status"\s*:\s*"([^"]+)"/);
+  const messageMatch = msg.match(/"message"\s*:\s*"([^"]+)"/);
+  const parts = [codeMatch?.[1], statusMatch?.[1], messageMatch?.[1]].filter(Boolean);
+  return parts.length > 0 ? parts.join(" - ").slice(0, 140) : msg.slice(0, 140);
+}
+
+export async function testGeminiKeys(
+  rawApiKeys?: string,
+  modelMode?: GeminiModelMode
+): Promise<KeyTestResult[]> {
+  const pool = resolveEffectiveKeyPool(rawApiKeys);
+  if (pool.length === 0) {
+    return [
+      {
+        maskedKey: "بدون کلید",
+        isServerDefault: true,
+        ok: false,
+        error: "هیچ کلیدی وارد نشده است.",
+      },
+    ];
+  }
+
+  const baseModels = getBaseModelOrder(modelMode);
+  const results = await Promise.all(
+    pool.map(async (entry): Promise<KeyTestResult> => {
+      const ai = getGeminiClient(entry.key);
+      const discovered = await discoverAvailableModelsForKey(entry.key, entry.tag);
+      const mergedMap = new Map<string, ModelCandidate>();
+      for (const m of discovered) mergedMap.set(m.id, m);
+      for (const m of baseModels) {
+        if (!mergedMap.has(m.id)) mergedMap.set(m.id, m);
+      }
+      const models = Array.from(mergedMap.values()).slice(0, 16);
+
+      // Probe all discovered models concurrently and resolve as soon as the FIRST healthy model responds!
+      const errorNotes: string[] = [];
+      let sawInvalidKey = false;
+      let invalidDetail = "";
+      let sawQuota = false;
+      let sawBusy = false;
+      let sawForbidden = false;
+
+      const probePromises = models.map(async (candidate) => {
+        const useJsonMime = candidate.supportsJsonMode !== false;
+        try {
+          await callGenerateContentWithTimeout(
+            ai,
+            {
+              model: candidate.id,
+              contents: 'Return JSON: {"ok":true}',
+              config: {
+                ...(useJsonMime ? { responseMimeType: "application/json" } : {}),
+                ...(candidate.thinkingLevel
+                  ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
+                  : {}),
+              },
+            },
+            15000
+          );
+          return candidate;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          errorNotes.push(`${candidate.id}: ${summarizeRawError(msg)}`);
+          if (isInvalidApiKeyError(err)) {
+            sawInvalidKey = true;
+            invalidDetail = summarizeRawError(msg);
+          } else if (isModelConfigOrAccessError(err)) {
+            keyModelCooldownUntil.set(`${entry.tag}:${candidate.id}`, Date.now() + PERMANENT_SKIP_MS);
+          }
+          if (isQuotaError(err)) sawQuota = true;
+          else if (isBusyOrTransientError(err)) sawBusy = true;
+          else if (msg.includes("403") || msg.includes("PERMISSION_DENIED")) sawForbidden = true;
+          throw err;
+        }
+      });
+
+      try {
+        const winner = await Promise.any(probePromises);
+        keyModelCooldownUntil.delete(`${entry.tag}:${winner.id}`);
+        lastHealthyModelByKey.set(entry.tag, winner.id);
+        return {
+          maskedKey: entry.isServerDefault ? "کلید پیش‌فرض سرور" : maskApiKey(entry.key),
+          isServerDefault: entry.isServerDefault,
+          ok: true,
+          workingModel: winner.id,
+          availableModels: discovered.map((d) => d.id),
+        };
+      } catch {
+        // All probes rejected
+      }
+
+      if (sawInvalidKey) {
+        return {
+          maskedKey: entry.isServerDefault ? "کلید پیش‌فرض سرور" : maskApiKey(entry.key),
+          isServerDefault: entry.isServerDefault,
+          ok: false,
+          error: "کلید نامعتبر یا منقضی شده است.",
+          detail: invalidDetail,
+        };
+      }
+
+      console.warn(`[TestKey Failed] ${entry.tag}:`, errorNotes.join(" | "));
+
+      const friendly = sawQuota
+        ? "سهمیه رایگان این کلید موقتاً پر شده است (429)."
+        : sawForbidden
+          ? "کلید دسترسی به مدل‌ها ندارد یا محدودیت منطقه‌ای/پروژه دارد (403)."
+          : sawBusy
+            ? "همه مدل‌های این کلید موقتاً شلوغ هستند (503). چند لحظه بعد دوباره تست کنید."
+            : "هیچ مدل فعالی با این کلید پاسخ نداد.";
+      return {
+        maskedKey: entry.isServerDefault ? "کلید پیش‌فرض سرور" : maskApiKey(entry.key),
+        isServerDefault: entry.isServerDefault,
+        ok: false,
+        availableModels: discovered.map((d) => d.id),
+        error: friendly,
+        detail: errorNotes.slice(0, 5).join(" | "),
+      };
+    })
+  );
+
+  return results;
 }
 
 interface LiveFallbackWebContext {
@@ -388,7 +1082,6 @@ export async function researchProductWithGemini(
     seedUrl?: string;
   }
 ): Promise<GeminiProductResearchResult> {
-  const ai = getGeminiClient(settings.geminiApiKey);
 
   const toneGuide =
     settings.tone === "technical"
@@ -487,7 +1180,7 @@ ${extraWebContext ? `\nنتایج به‌دست‌آمده از جستجوی و�
         }
       : promptText;
 
-  let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+  let response: Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>> | null = null;
   let parsed: Record<string, unknown> | null = null;
   let fallbackContext: LiveFallbackWebContext | null = null;
 
@@ -505,55 +1198,64 @@ ${extraWebContext ? `\nنتایج به‌دست‌آمده از جستجوی و�
     });
     parsed = extractJsonObject(rawJsonText);
   } else {
-    // Phase 1: Try Google Search grounding once if not in quota cooldown
-    if (Date.now() >= searchToolBlockedUntil) {
-      const searchModels = getOrderedModelPool(false).slice(0, 2);
-      for (const candidate of searchModels) {
-        if (Date.now() < searchToolBlockedUntil) break;
-        try {
-          const candidateResp = await callGenerateContentWithTimeout(
-            ai,
-            {
-              model: candidate.id,
-              contents: buildContents(buildPrompt()),
-              config: {
-                tools: [{ googleSearch: {} }],
-                ...(candidate.thinkingLevel
-                  ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
-                  : {}),
+    const useFreeTierSaver = settings.freeTierSaver !== false;
+
+    // Phase 1: Try Google Search grounding only when Free Tier Quota Saver is disabled
+    if (!useFreeTierSaver && Date.now() >= searchToolBlockedUntil) {
+      const keyPool = getOrderedKeyPool(settings.geminiApiKey);
+      const firstKey = keyPool[0];
+      if (firstKey) {
+        const ai = getGeminiClient(firstKey.key);
+        const searchModels = getOrderedModelPoolForKey(
+          firstKey.tag,
+          settings.geminiModelMode,
+          false
+        ).slice(0, 2);
+        for (const candidate of searchModels) {
+          if (Date.now() < searchToolBlockedUntil) break;
+          try {
+            const candidateResp = await callGenerateContentWithTimeout(
+              ai,
+              {
+                model: candidate.id,
+                contents: buildContents(buildPrompt()),
+                config: {
+                  tools: [{ googleSearch: {} }],
+                  ...(candidate.thinkingLevel
+                    ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
+                    : {}),
+                },
               },
-            },
-            16000
-          );
-          parsed = extractJsonObject(candidateResp.text ?? "");
-          response = candidateResp;
-          modelCooldownUntil.delete(candidate.id);
-          lastHealthyModel = candidate.id;
-          break;
-        } catch (err) {
-          if (isAuthOrFatalError(err)) {
-            throw err;
-          }
-          if (isQuotaError(err)) {
-            // Search grounding quota exhausted (common on free tier): cool down search tool only
-            searchToolBlockedUntil = Date.now() + 15 * 60 * 1000;
+              14000
+            );
+            parsed = extractJsonObject(candidateResp.text ?? "");
+            response = candidateResp;
+            keyModelCooldownUntil.delete(`${firstKey.tag}:${candidate.id}`);
+            lastHealthyModelByKey.set(firstKey.tag, candidate.id);
+            break;
+          } catch (err) {
+            if (isInvalidApiKeyError(err)) {
+              break;
+            }
+            if (isQuotaError(err)) {
+              searchToolBlockedUntil = Date.now() + 15 * 60 * 1000;
+              break;
+            }
+            if (isModelConfigOrAccessError(err)) {
+              keyModelCooldownUntil.set(`${firstKey.tag}:${candidate.id}`, Date.now() + PERMANENT_SKIP_MS);
+              continue;
+            }
+            if (isBusyOrTransientError(err)) {
+              keyModelCooldownUntil.set(`${firstKey.tag}:${candidate.id}`, Date.now() + BUSY_COOLDOWN_MS);
+              continue;
+            }
             break;
           }
-          if (isNotFoundError(err)) {
-            modelCooldownUntil.set(candidate.id, Date.now() + PERMANENT_SKIP_MS);
-            continue;
-          }
-          if (isBusyOrTransientError(err)) {
-            modelCooldownUntil.set(candidate.id, Date.now() + BUSY_COOLDOWN_MS);
-            continue;
-          }
-          // JSON parse failure from search mode -> continue to structured JSON fallback below
-          break;
         }
       }
     }
 
-    // Phase 2: Live web context + resilient structured JSON generation across healthy models
+    // Phase 2: Free live web context + resilient multi-key / multi-model structured JSON generation
     if (!response || !parsed) {
       fallbackContext = await fetchLiveWebContextFallback(query);
       const promptText = buildPrompt(fallbackContext.contextSummary);
@@ -562,12 +1264,13 @@ ${extraWebContext ? `\nنتایج به‌دست‌آمده از جستجوی و�
       let parseError: unknown = null;
       for (let parseTry = 0; parseTry < 2; parseTry++) {
         const candidateResp = await generateWithResilientModels({
-          ai,
+          rawApiKeys: settings.geminiApiKey,
+          modelMode: settings.geminiModelMode,
           contents,
           jsonMode: true,
-          timeoutMs: 22000,
+          timeoutMs: 36000,
           maxRounds: 2,
-          totalBudgetMs: 40000,
+          totalBudgetMs: 46000,
         });
         try {
           parsed = extractJsonObject(candidateResp.text ?? "");
@@ -711,15 +1414,21 @@ export async function findMoreProductPagesWithGemini(
   productName: string,
   brand: string,
   isMedical = true,
-  apiKey?: string
+  apiKey?: string,
+  freeTierSaver = true
 ): Promise<string[]> {
-  const ai = getGeminiClient(apiKey);
+  const urls = new Set<string>();
 
-  const domainHint = isMedical
-    ? "official medical device manufacturer product page, medical supply store, Amazon, or Digikala"
-    : "official manufacturer product gallery page, press kit, Amazon, BestBuy, or Digikala";
+  if (!freeTierSaver && Date.now() >= searchToolBlockedUntil) {
+    const keyPool = getOrderedKeyPool(apiKey);
+    const firstKey = keyPool[0];
+    if (firstKey) {
+      const ai = getGeminiClient(firstKey.key);
+      const domainHint = isMedical
+        ? "official medical device manufacturer product page, medical supply store, Amazon, or Digikala"
+        : "official manufacturer product gallery page, press kit, Amazon, BestBuy, or Digikala";
 
-  const prompt = `
+      const prompt = `
 Find 6 real, direct web page URLs (${domainHint}) that contain high-resolution product photos for:
 Product: "${productName}" ${brand ? `(Brand: ${brand})` : ""}
 
@@ -729,55 +1438,53 @@ Return ONLY a JSON object:
 }
 `.trim();
 
-  const urls = new Set<string>();
-
-  if (Date.now() >= searchToolBlockedUntil) {
-    const modelsToTry = getOrderedModelPool(false).slice(0, 2);
-    for (const candidate of modelsToTry) {
-      if (Date.now() < searchToolBlockedUntil) break;
-      try {
-        const response = await callGenerateContentWithTimeout(
-          ai,
-          {
-            model: candidate.id,
-            contents: prompt,
-            config: {
-              tools: [{ googleSearch: {} }],
-              ...(candidate.thinkingLevel
-                ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
-                : {}),
-            },
-          },
-          15000
-        );
-        const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-        for (const c of chunks) {
-          if (c?.web?.uri) urls.add(c.web.uri);
-        }
+      const modelsToTry = getOrderedModelPoolForKey(firstKey.tag, "auto_free", false).slice(0, 2);
+      for (const candidate of modelsToTry) {
+        if (Date.now() < searchToolBlockedUntil) break;
         try {
-          const parsed = extractJsonObject(response.text ?? "");
-          if (Array.isArray(parsed.urls)) {
-            for (const u of parsed.urls) {
-              if (typeof u === "string" && u.startsWith("http")) urls.add(u);
-            }
+          const response = await callGenerateContentWithTimeout(
+            ai,
+            {
+              model: candidate.id,
+              contents: prompt,
+              config: {
+                tools: [{ googleSearch: {} }],
+                ...(candidate.thinkingLevel
+                  ? { thinkingConfig: { thinkingLevel: candidate.thinkingLevel } }
+                  : {}),
+              },
+            },
+            14000
+          );
+          const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+          for (const c of chunks) {
+            if (c?.web?.uri) urls.add(c.web.uri);
           }
-        } catch {
-          // Grounding chunks are still valid
+          try {
+            const parsed = extractJsonObject(response.text ?? "");
+            if (Array.isArray(parsed.urls)) {
+              for (const u of parsed.urls) {
+                if (typeof u === "string" && u.startsWith("http")) urls.add(u);
+              }
+            }
+          } catch {
+            // Grounding chunks are still valid
+          }
+          if (urls.size > 0) break;
+        } catch (err) {
+          if (isQuotaError(err)) {
+            searchToolBlockedUntil = Date.now() + 15 * 60 * 1000;
+            break;
+          }
+          if (isInvalidApiKeyError(err)) break;
         }
-        if (urls.size > 0) break;
-      } catch (err) {
-        if (isQuotaError(err)) {
-          searchToolBlockedUntil = Date.now() + 15 * 60 * 1000;
-          break;
-        }
-        if (!isRetryableModelError(err)) break;
       }
     }
   }
 
-  // Fallback to live web search pages if Gemini search grounding is unavailable or empty
+  // Always use fast, free live web search pages if empty or in Free Tier Saver mode
   if (urls.size === 0) {
-    const live = await fetchLiveWebContextFallback(productName);
+    const live = await fetchLiveWebContextFallback(brand ? `${brand} ${productName}` : productName);
     for (const u of live.pageUrls) urls.add(u);
   }
 
@@ -790,7 +1497,6 @@ export async function extractProductListFromScan(params: {
   isMedical?: boolean;
   settings?: EnrichmentSettings;
 }): Promise<{ items: string[]; note?: string }> {
-  const ai = getGeminiClient(params.settings?.geminiApiKey);
   const domainNote = params.isMedical
     ? "این برگه مربوط به لیست تجهیزات پزشکی و سلامت است؛ نام دستگاه، برند، مدل یا کد فنی (مثل BM28، YX306، سایز یا ظرفیت) را در صورت وجود در کنار نام کالا حفظ کن تا جستجو دقیق باشد."
     : "نام کالا، برند و کد مدل را در صورت وجود در کنار هم حفظ کن.";
@@ -823,11 +1529,12 @@ export async function extractProductListFromScan(params: {
       prompt,
       imageBase64: params.base64Data,
       imageMimeType: params.mimeType,
-      timeoutMs: 45000,
+      timeoutMs: 42000,
     });
   } else {
     const response = await generateWithResilientModels({
-      ai,
+      rawApiKeys: params.settings?.geminiApiKey,
+      modelMode: params.settings?.geminiModelMode,
       contents: {
         parts: [
           {
@@ -840,9 +1547,9 @@ export async function extractProductListFromScan(params: {
         ],
       },
       jsonMode: true,
-      timeoutMs: 20000,
-      maxRounds: 1,
-      totalBudgetMs: 38000,
+      timeoutMs: 32000,
+      maxRounds: 2,
+      totalBudgetMs: 44000,
     });
     rawText = response.text ?? "{}";
   }

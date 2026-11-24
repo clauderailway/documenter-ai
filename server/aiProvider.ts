@@ -128,11 +128,11 @@ export async function generateJsonWithExternalProvider(params: {
     throw new Error(`نام مدل برای ارائه‌دهنده «${provider.name}» مشخص نشده است.`);
   }
 
-  const apiKey = resolveProviderServerKey(provider.type);
+  const apiKey = (provider.apiKey || "").trim() || resolveProviderServerKey(provider.type);
   if (!apiKey) {
     const envVarName = ENV_KEY_NAMES[provider.type];
     throw new Error(
-      `کلید سرور برای ارائه‌دهنده «${provider.name}» تنظیم نشده است. متغیر محیطی ${envVarName} (یا CUSTOM_AI_API_KEY) را در تنظیمات سرور قرار دهید.`
+      `کلید API برای ارائه‌دهنده «${provider.name}» وارد نشده است. لطفاً کلید خود را در بخش تنظیمات همین ارائه‌دهنده وارد کنید (یا متغیر ${envVarName} را روی سرور تنظیم کنید).`
     );
   }
 

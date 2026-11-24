@@ -1,10 +1,11 @@
 import React, { useState } from "react";
-import { Check, Cpu, Plus, Trash2 } from "lucide-react";
+import { Check, Cpu, KeyRound, Loader2, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import type {
   ContentTone,
   CustomProviderProfile,
   DomainProfile,
   EnrichmentSettings,
+  GeminiModelMode,
   LongDescFormat,
   OutputLanguage,
   WebpFitMode,
@@ -16,6 +17,14 @@ interface SettingsPanelProps {
   onChange: (next: EnrichmentSettings) => void;
 }
 
+interface KeyTestResult {
+  maskedKey: string;
+  isServerDefault: boolean;
+  ok: boolean;
+  workingModel?: string;
+  error?: string;
+}
+
 type ExternalProviderType = CustomProviderProfile["type"];
 
 const PROVIDER_PRESETS: Record<
@@ -23,22 +32,22 @@ const PROVIDER_PRESETS: Record<
   { label: string; baseUrl: string; defaultModel: string; envVar: string }
 > = {
   openrouter: {
-    label: "OpenRouter (سازگار با OpenAI)",
+    label: "OpenRouter (دارای مدل‌های رایگان :free)",
     baseUrl: "https://openrouter.ai/api/v1",
-    defaultModel: "google/gemini-2.5-flash",
+    defaultModel: "openrouter/free",
     envVar: "OPENROUTER_API_KEY",
+  },
+  groq: {
+    label: "Groq (رایگان و فوق‌سریع)",
+    baseUrl: "https://api.groq.com/openai/v1",
+    defaultModel: "llama-3.3-70b-versatile",
+    envVar: "GROQ_API_KEY",
   },
   openai: {
     label: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
     defaultModel: "gpt-4o-mini",
     envVar: "OPENAI_API_KEY",
-  },
-  groq: {
-    label: "Groq",
-    baseUrl: "https://api.groq.com/openai/v1",
-    defaultModel: "llama-3.3-70b-versatile",
-    envVar: "GROQ_API_KEY",
   },
   custom: {
     label: "سفارشی (سازگار با OpenAI مثل DeepSeek / AvalAI / Together)",
@@ -48,24 +57,124 @@ const PROVIDER_PRESETS: Record<
   },
 };
 
+function parseKeyList(raw: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of (raw || "").split(/[\r\n,;\s]+/)) {
+    const clean = part.trim();
+    if (clean.length >= 10 && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+function maskKeyDisplay(key: string): string {
+  if (key.length <= 12) return "••••••••";
+  return `${key.slice(0, 6)}••••${key.slice(-4)}`;
+}
+
 export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange }) => {
+  const [newGeminiKeyInput, setNewGeminiKeyInput] = useState("");
+  const [isTestingKeys, setIsTestingKeys] = useState(false);
+  const [keyTestResults, setKeyTestResults] = useState<KeyTestResult[] | null>(null);
+  const [keyTestError, setKeyTestError] = useState<string | null>(null);
+
   const [providerType, setProviderType] = useState<ExternalProviderType>("openrouter");
-  const [providerName, setProviderName] = useState("OpenRouter اصلی");
+  const [providerName, setProviderName] = useState("OpenRouter رایگان");
   const [providerBaseUrl, setProviderBaseUrl] = useState(PROVIDER_PRESETS.openrouter.baseUrl);
   const [providerModel, setProviderModel] = useState(PROVIDER_PRESETS.openrouter.defaultModel);
+  const [providerApiKey, setProviderApiKey] = useState("");
   const [providerFormError, setProviderFormError] = useState<string | null>(null);
 
   const customProviders = settings.customProviders ?? [];
   const activeProviderId = settings.aiProviderId || "gemini-default";
+  const savedGeminiKeys = parseKeyList(settings.geminiApiKey || "");
+  const geminiModelMode: GeminiModelMode = settings.geminiModelMode || "auto_free";
+  const freeTierSaver = settings.freeTierSaver !== false;
+
+  const handleAddGeminiKeys = () => {
+    const incoming = parseKeyList(newGeminiKeyInput);
+    if (incoming.length === 0) return;
+    const merged = Array.from(new Set([...savedGeminiKeys, ...incoming])).slice(0, 20);
+    onChange({
+      ...settings,
+      aiProviderId: "gemini-default",
+      geminiApiKey: merged.join("\n"),
+    });
+    setNewGeminiKeyInput("");
+    setKeyTestResults(null);
+    setKeyTestError(null);
+  };
+
+  const handleRemoveGeminiKey = (keyToRemove: string) => {
+    const next = savedGeminiKeys.filter((k) => k !== keyToRemove);
+    onChange({
+      ...settings,
+      geminiApiKey: next.join("\n"),
+    });
+    setKeyTestResults(null);
+  };
+
+  const handleTestKeys = async () => {
+    setIsTestingKeys(true);
+    setKeyTestError(null);
+    setKeyTestResults(null);
+
+    // Include any unsaved key typed in the input box automatically
+    const pendingIncoming = parseKeyList(newGeminiKeyInput);
+    let effectiveSettings = settings;
+    if (pendingIncoming.length > 0) {
+      const merged = Array.from(new Set([...savedGeminiKeys, ...pendingIncoming])).slice(0, 20);
+      effectiveSettings = {
+        ...settings,
+        aiProviderId: "gemini-default",
+        geminiApiKey: merged.join("\n"),
+      };
+      onChange(effectiveSettings);
+      setNewGeminiKeyInput("");
+    }
+
+    try {
+      const res = await fetch("/api/ai/test-keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: effectiveSettings }),
+      });
+      const rawText = await res.text();
+      let data: { results?: KeyTestResult[]; error?: string } | null = null;
+      try {
+        data = JSON.parse(rawText) as { results?: KeyTestResult[]; error?: string };
+      } catch {
+        data = null;
+      }
+      if (!data || !res.ok) {
+        throw new Error(data?.error || `خطا در تست کلیدها (کد ${res.status})`);
+      }
+      setKeyTestResults(data.results || []);
+    } catch (err) {
+      setKeyTestError(err instanceof Error ? err.message : "خطا در بررسی کلیدها");
+    } finally {
+      setIsTestingKeys(false);
+    }
+  };
 
   const handleProviderTypeChange = (nextType: ExternalProviderType) => {
     setProviderType(nextType);
     const preset = PROVIDER_PRESETS[nextType];
     setProviderBaseUrl(preset.baseUrl);
     setProviderModel(preset.defaultModel);
-    if (!providerName.trim() || Object.values(PROVIDER_PRESETS).some((p) => providerName.startsWith(p.label.split(" ")[0]))) {
+    if (
+      !providerName.trim() ||
+      Object.values(PROVIDER_PRESETS).some((p) => providerName.startsWith(p.label.split(" ")[0]))
+    ) {
       setProviderName(
-        nextType === "custom" ? "پروایدر سفارشی" : `${preset.label.split(" ")[0]} اصلی`
+        nextType === "custom"
+          ? "پروایدر سفارشی"
+          : nextType === "openrouter" || nextType === "groq"
+            ? `${preset.label.split(" ")[0]} رایگان`
+            : `${preset.label.split(" ")[0]} اصلی`
       );
     }
     setProviderFormError(null);
@@ -76,6 +185,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
     const cleanName = providerName.trim();
     const cleanBaseUrl = providerBaseUrl.trim().replace(/\/+$/, "");
     const cleanModel = providerModel.trim();
+    const cleanApiKey = providerApiKey.trim();
 
     if (!cleanName) {
       setProviderFormError("لطفاً یک نام برای ارائه‌دهنده وارد کنید.");
@@ -96,6 +206,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
       type: providerType,
       baseUrl: cleanBaseUrl,
       model: cleanModel,
+      ...(cleanApiKey ? { apiKey: cleanApiKey } : {}),
     };
 
     onChange({
@@ -103,6 +214,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
       aiProviderId: newProfile.id,
       customProviders: [...customProviders, newProfile],
     });
+    setProviderApiKey("");
     setProviderFormError(null);
   };
 
@@ -122,7 +234,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
           <div className="space-y-1">
             <h1 className="text-xl font-bold text-slate-900">تنظیمات پروایدرها، فروشگاه و تبدیل WebP</h1>
             <p className="text-xs text-slate-500">
-              مدیریت ارائه‌دهندگان هوش مصنوعی و تنظیمات پیش‌فرض برای سایت تجهیزات پزشکی و ووکامرس.
+              مدیریت کلیدهای رایگان AI Studio، چرخش خودکار کلیدها و تنظیمات پیش‌فرض فروشگاه.
             </p>
           </div>
           <button
@@ -140,21 +252,21 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
             <div className="space-y-1">
               <h2 className="text-base font-semibold text-slate-900 flex items-center gap-2">
                 <Cpu className="w-4 h-4 text-blue-700" />
-                ارائه‌دهندگان هوش مصنوعی (AI Providers)
+                ارائه‌دهندگان هوش مصنوعی و کلیدهای رایگان
               </h2>
               <p className="text-xs text-slate-500 leading-relaxed">
-                می‌توانید علاوه بر موتور پیش‌فرض سیستم، ارائه‌دهندگان سازگار با OpenAI (مثل OpenRouter، OpenAI، Groq یا سرویس‌های سفارشی) را اضافه و انتخاب کنید.
+                می‌توانید یک یا چند کلید رایگان Google AI Studio اضافه کنید تا سیستم به‌صورت خودکار بین مدل‌های رایگان و کلیدها جابه‌جا شود و به محدودیت سهمیه نخورید.
               </p>
             </div>
           </div>
 
           {/* Saved Providers List */}
-          <div className="space-y-2">
-            {/* Built-in Gemini Default with Custom API Key Input */}
+          <div className="space-y-2.5">
+            {/* Built-in Gemini Default with Free-Tier Multi-Key Pool */}
             <div
-              className={`rounded-lg border p-4 space-y-3 transition-colors ${
+              className={`rounded-lg border p-4 space-y-4 transition-colors ${
                 activeProviderId === "gemini-default"
-                  ? "border-blue-600 bg-blue-50/50"
+                  ? "border-blue-600 bg-blue-50/40"
                   : "border-slate-200 bg-white hover:bg-slate-50"
               }`}
             >
@@ -182,10 +294,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                   </span>
                   <div className="min-w-0">
                     <div className="text-sm font-semibold text-slate-900">
-                      موتور پیش‌فرض (Gemini با Failover خودکار)
+                      Google AI Studio (Gemini رایگان با چرخش خودکار مدل و کلید)
                     </div>
                     <div className="text-xs text-slate-500 font-mono truncate" dir="ltr">
-                      gemini-4-hydrogen · gemini-3.1-flash-lite
+                      Auto-discovery: Gemini 4 / 3.x Flash &amp; Flash-Lite · Gemma 4
                     </div>
                   </div>
                 </div>
@@ -196,32 +308,164 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                 )}
               </div>
 
-              {/* API Key Input Section */}
-              <div className="pt-2 border-t border-slate-200/80 space-y-1.5" onClick={(e) => e.stopPropagation()}>
-                <label className="block text-xs font-medium text-slate-700">
-                  کلید اختصاصی AI Studio (Gemini API Key)
-                </label>
+              {/* Multi-Key Pool Manager */}
+              <div
+                className="pt-3 border-t border-slate-200/80 space-y-3"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <label className="text-xs font-medium text-slate-800 flex items-center gap-1.5">
+                    <KeyRound className="w-3.5 h-3.5 text-blue-700" />
+                    کلیدهای رایگان AI Studio ({savedGeminiKeys.length > 0 ? `${savedGeminiKeys.length} کلید فعال` : "کلید پیش‌فرض سرور"})
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleTestKeys}
+                    disabled={isTestingKeys}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 transition-colors cursor-pointer"
+                  >
+                    {isTestingKeys ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3 h-3" />
+                    )}
+                    تست اتصال کلیدها
+                  </button>
+                </div>
+
+                {/* Add One or Multiple Keys */}
                 <div className="flex items-center gap-2">
                   <input
                     type="password"
                     dir="ltr"
-                    value={settings.geminiApiKey || ""}
-                    onChange={(e) => onChange({ ...settings, geminiApiKey: e.target.value })}
-                    placeholder="AIzaSy..."
-                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-blue-600 focus:outline-none"
+                    value={newGeminiKeyInput}
+                    onChange={(e) => setNewGeminiKeyInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        handleAddGeminiKeys();
+                      }
+                    }}
+                    placeholder="AIzaSy... (می‌توانید چند کلید را با ویرگول یا جداگانه اضافه کنید)"
+                    className="flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-blue-600 focus:outline-none"
                   />
-                  {settings.geminiApiKey ? (
-                    <span className="text-[11px] font-medium text-emerald-600 whitespace-nowrap">
-                      کلید فعال شد ✓
-                    </span>
-                  ) : (
-                    <span className="text-[11px] text-slate-400 whitespace-nowrap">
-                      پیش‌فرض سرور
-                    </span>
-                  )}
+                  <button
+                    type="button"
+                    onClick={handleAddGeminiKeys}
+                    disabled={parseKeyList(newGeminiKeyInput).length === 0}
+                    className="inline-flex items-center gap-1 rounded-lg bg-blue-700 px-3 py-2 text-xs font-medium text-white hover:bg-blue-800 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    افزودن کلید
+                  </button>
                 </div>
+
+                {/* Saved Keys List */}
+                {savedGeminiKeys.length > 0 && (
+                  <div className="space-y-1.5">
+                    {savedGeminiKeys.map((k, idx) => (
+                      <div
+                        key={k}
+                        className="flex items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-3 py-1.5"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-[11px] font-medium text-slate-500 shrink-0">
+                            کلید {idx + 1}
+                          </span>
+                          <code className="text-xs font-mono text-slate-800 truncate" dir="ltr">
+                            {maskKeyDisplay(k)}
+                          </code>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveGeminiKey(k)}
+                          title="حذف کلید"
+                          className="p-1 rounded text-slate-400 hover:text-red-700 hover:bg-red-50 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Key Test Results */}
+                {keyTestError && (
+                  <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                    {keyTestError}
+                  </div>
+                )}
+
+                {keyTestResults && (
+                  <div className="space-y-1.5 rounded-md border border-slate-200 bg-white p-2.5">
+                    {keyTestResults.map((res, idx) => (
+                      <div
+                        key={`${res.maskedKey}-${idx}`}
+                        className="flex items-center justify-between gap-2 text-xs"
+                      >
+                        <span className="font-mono text-slate-700" dir="ltr">
+                          {res.maskedKey}
+                        </span>
+                        {res.ok ? (
+                          <span className="text-emerald-700 font-medium">
+                            متصل ✓ ({res.workingModel})
+                          </span>
+                        ) : (
+                          <span className="text-red-700">{res.error}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Model Strategy & Free-Tier Quota Saver */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
+                  <div className="space-y-1">
+                    <label className="block text-[11px] font-medium text-slate-700">
+                      اولویت انتخاب مدل Gemini
+                    </label>
+                    <select
+                      value={geminiModelMode}
+                      onChange={(e) =>
+                        onChange({
+                          ...settings,
+                          geminiModelMode: e.target.value as GeminiModelMode,
+                        })
+                      }
+                      className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-900 focus:border-blue-600 focus:outline-none"
+                    >
+                      <option value="auto_free">خودکار — کشف و انتخاب بهترین مدل رایگان فعال (پیشنهادی)</option>
+                      <option value="gemini-flash-lite-latest">gemini-flash-lite-latest (بیشترین سهمیه رایگان)</option>
+                      <option value="gemini-flash-latest">gemini-flash-latest (دقیق و متعادل)</option>
+                      <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (سبک و سریع)</option>
+                      <option value="gemini-4-hydrogen">gemini-4-hydrogen (جدیدترین نسل)</option>
+                      <option value="auto_quality">خودکار — حداکثر کیفیت</option>
+                    </select>
+                  </div>
+
+                  <label className="flex items-start gap-2.5 rounded-lg border border-slate-200 bg-white p-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={freeTierSaver}
+                      onChange={(e) =>
+                        onChange({ ...settings, freeTierSaver: e.target.checked })
+                      }
+                      className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-700 focus:ring-blue-600"
+                    />
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-medium text-slate-800 flex items-center gap-1">
+                        <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                        صرفه‌جویی در سهمیه رایگان
+                      </div>
+                      <p className="text-[11px] text-slate-500 leading-snug">
+                        کاهش مصرف به ۱ درخواست در هر کالا و جلوگیری از محدودیت جستجوی گوگل در نسخه رایگان.
+                      </p>
+                    </div>
+                  </label>
+                </div>
+
                 <p className="text-[11px] text-slate-500 leading-relaxed">
-                  با وارد کردن کلید AI Studio شخصی خود، تمامی درخواست‌های هوش مصنوعی با حساب کاربری و سهمیه شما پردازش می‌شوند.
+                  نکته: اگر ۲ یا چند کلید رایگان از اکانت‌های مختلف AI Studio اضافه کنید، درخواست‌ها بین آن‌ها تقسیم می‌شوند و در صورت پرشدن سهمیه یک کلید، سیستم خودکار روی کلید یا مدل رایگان بعدی ادامه می‌دهد.
                 </p>
               </div>
             </div>
@@ -266,7 +510,16 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                         {prov.model} · {prov.baseUrl}
                       </div>
                       <div className="text-[11px] text-slate-400">
-                        متغیر کلید روی سرور: <code className="font-mono text-slate-600">{envHint}</code>
+                        {prov.apiKey ? (
+                          <span className="text-emerald-700">
+                            کلید شخصی ذخیره شده ({maskKeyDisplay(prov.apiKey)})
+                          </span>
+                        ) : (
+                          <>
+                            متغیر کلید روی سرور:{" "}
+                            <code className="font-mono text-slate-600">{envHint}</code>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -294,13 +547,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
             })}
           </div>
 
-          {/* Add New Provider Form (Server-side env key only, no API key input in UI) */}
+          {/* Add New External Provider Form (OpenRouter Free / Groq Free / Custom) */}
           <form
             onSubmit={handleAddProvider}
             className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 space-y-4"
           >
             <div className="text-xs font-semibold text-slate-800">
-              افزودن ارائه‌دهنده جدید
+              افزودن ارائه‌دهنده جایگزین (مثل OpenRouter رایگان یا Groq)
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -325,7 +578,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                   type="text"
                   value={providerName}
                   onChange={(e) => setProviderName(e.target.value)}
-                  placeholder="مثلاً OpenRouter اصلی"
+                  placeholder="مثلاً OpenRouter رایگان"
                   className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 focus:border-blue-600 focus:outline-none"
                 />
               </div>
@@ -351,7 +604,21 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
                   dir="ltr"
                   value={providerModel}
                   onChange={(e) => setProviderModel(e.target.value)}
-                  placeholder="google/gemini-2.5-flash"
+                  placeholder="openrouter/free"
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-blue-600 focus:outline-none"
+                />
+              </div>
+
+              <div className="md:col-span-2 space-y-1.5">
+                <label className="block text-xs font-medium text-slate-700">
+                  کلید API شخصی این سرویس (اختیاری — در صورت خالی بودن از کلید سرور استفاده می‌شود)
+                </label>
+                <input
+                  type="password"
+                  dir="ltr"
+                  value={providerApiKey}
+                  onChange={(e) => setProviderApiKey(e.target.value)}
+                  placeholder="sk-or-... یا gsk_..."
                   className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono text-slate-900 text-left focus:border-blue-600 focus:outline-none"
                 />
               </div>
@@ -363,11 +630,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ settings, onChange
 
             <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
               <p className="text-[11px] text-slate-500 leading-relaxed max-w-lg">
-                احراز هویت این سرویس به‌صورت امن فقط از سمت سرور و از متغیر محیطی{" "}
-                <code className="font-mono text-slate-700">
-                  {PROVIDER_PRESETS[providerType].envVar}
-                </code>{" "}
-                (یا <code className="font-mono text-slate-700">CUSTOM_AI_API_KEY</code>) خوانده می‌شود.
+                کلید شخصی شما فقط در مرورگر خودتان ذخیره شده و هنگام ارسال درخواست به سرور برای پردازش استفاده می‌شود.
               </p>
 
               <button
