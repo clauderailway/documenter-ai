@@ -1,0 +1,10 @@
+{
+  "name": "Remix کالاساز | تکمیل هوشمند اطلاعات و تصاویر WebP کالا",
+  "description": "ابزار هوشمند جستجوی اطلاعات کالا از سایت برندها و فروشگاه‌ها، تولید عنوان و توضیحات کوتاه و بلند و تبدیل خودکار تصاویر به فرمت WebP برای فروشگاه‌های اینترنتی.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
